@@ -48,6 +48,14 @@ def _slack_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _truncate(text: str, max_chars: int) -> str:
+    t = (text or "").strip()
+    if len(t) <= max_chars:
+        return t
+    # Slack doesn't collapse long text; keep it scannable.
+    return t[: max(0, max_chars - 1)].rstrip() + "…"
+
+
 def _parse_csv_env(raw: str) -> list[str]:
     return [p.strip() for p in raw.split(",") if p.strip()]
 
@@ -375,22 +383,53 @@ def _build_blocks(
 
         omitted = 0
         for idx, (item, scored, source_label) in enumerate(rows):
-            if used + 1 > block_budget:
+            # Card uses up to 4 blocks: divider + meta + summary + actions.
+            if used + 4 > block_budget:
                 omitted = len(rows) - idx
                 break
             url = _gmail_open_url(item.thread_id)
             urgency_dot = {"High": "🔴", "Medium": "🟡", "Low": "⚪"}.get(scored.urgency, "⚪")
-            body = (
-                f"*Subject:* {_slack_escape(item.subject)}\n"
-                f"*From:* {_slack_escape(item.from_addr)}\n"
-                f"*Date:* {_slack_escape(item.date)}\n\n"
-                f"*Sublabel:* {_slack_escape(source_label)}\n\n"
-                f"*Relevance:* {scored.relevance}/5   *Urgency:* {urgency_dot} {scored.urgency}\n\n"
-                f"{_slack_escape(scored.summary)}\n\n"
-                f"<{url}|Open in Gmail>"
+            blocks.append({"type": "divider"})
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*{_slack_escape(item.subject)}*",
+                    },
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*From*\n{_slack_escape(item.from_addr)}"},
+                        {"type": "mrkdwn", "text": f"*Date*\n{_slack_escape(item.date)}"},
+                        {"type": "mrkdwn", "text": f"*Sublabel*\n{_slack_escape(source_label)}"},
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*Score*\nRelevance {scored.relevance}/5 · {urgency_dot} {scored.urgency}",
+                        },
+                    ],
+                }
             )
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": body}})
-            used += 1
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": _slack_escape(_truncate(scored.summary, 700)),
+                    },
+                }
+            )
+            blocks.append(
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Open in Gmail"},
+                            "url": url,
+                        }
+                    ],
+                }
+            )
+            used += 4
 
         if omitted > 0 and used + 1 <= block_budget:
             blocks.append(
