@@ -18,6 +18,7 @@ from googleapiclient.errors import HttpError
 
 GMAIL_SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
 GMAIL_TOKEN_URI = "https://oauth2.googleapis.com/token"
+DEBUG = (os.environ.get("DEBUG") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 @dataclass
@@ -128,8 +129,14 @@ def _matches_filter(subject: str, snippet: str, keywords: list[str]) -> bool:
     return any(k.lower() in hay for k in keywords)
 
 
+def _debug(msg: str) -> None:
+    if DEBUG:
+        print(msg, file=sys.stderr)
+
+
 def _list_message_refs(service: Any, label_id: str, days: int, max_count: int) -> list[dict[str, str]]:
     q = f"newer_than:{days}d"
+    _debug(f"[gmail] list: label_id={label_id} q={q!r} max={max_count}")
     refs: list[dict[str, str]] = []
     page_token: str | None = None
     while len(refs) < max_count:
@@ -350,6 +357,7 @@ def main() -> int:
     for label_name in cfg["labels"]:
         try:
             label_id = _label_id_by_name(service, label_name)
+            _debug(f"[gmail] resolved label {label_name!r} -> {label_id!r}")
             refs = _list_message_refs(
                 service,
                 label_id,
@@ -361,6 +369,10 @@ def main() -> int:
             return 1
 
         rows: list[tuple[EmailItem, str]] = []
+        fetched = len(refs)
+        keyword_filtered = 0
+        gemini_skipped = 0
+        kept = 0
         for ref in refs:
             mid = ref.get("id")
             if not mid:
@@ -371,12 +383,21 @@ def main() -> int:
                 print(f"Gmail API error fetching message {mid}: {e}", file=sys.stderr)
                 return 1
             if _matches_filter(item.subject, item.snippet, cfg["filter_keywords"]):
+                keyword_filtered += 1
+                _debug(f"[filter] keyword drop: {item.subject!r}")
                 continue
             summary = _summarise(cfg, model, item)
             if summary is None:
+                gemini_skipped += 1
+                _debug(f"[gemini] SKIP: {item.subject!r}")
                 continue
             rows.append((item, summary))
+            kept += 1
 
+        _debug(
+            "[label] "
+            + f"{label_name!r}: fetched={fetched} keyword_filtered={keyword_filtered} gemini_skipped={gemini_skipped} kept={kept}"
+        )
         label_sections.append((label_name, rows))
 
     blocks = _build_blocks(label_sections)

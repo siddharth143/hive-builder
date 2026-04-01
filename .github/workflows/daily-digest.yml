@@ -22,6 +22,7 @@ jobs:
       FILTER_KEYWORDS: ${{ secrets.FILTER_KEYWORDS }}
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       MAX_EMAILS_PER_LABEL: ${{ secrets.MAX_EMAILS_PER_LABEL }}
+      DEBUG: ${{ secrets.DEBUG }}
     steps:
       - uses: actions/checkout@v4
 
