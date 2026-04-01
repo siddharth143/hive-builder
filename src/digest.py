@@ -335,6 +335,12 @@ def _post_slack(webhook: str, blocks: list[dict[str, Any]]) -> bool:
 
 def main() -> int:
     cfg = _load_config()
+    print(
+        "[config] "
+        + f"labels={cfg['labels']!r} date_window_days={cfg['date_window_days']} "
+        + f"max_emails_per_label={cfg['max_emails_per_label']} filter_keywords={len(cfg['filter_keywords'])}",
+        file=sys.stderr,
+    )
     try:
         creds = _gmail_credentials(cfg)
         service = build("gmail", "v1", credentials=creds, cache_discovery=False)
@@ -394,9 +400,11 @@ def main() -> int:
             rows.append((item, summary))
             kept += 1
 
-        _debug(
+        # Always log aggregate counts (safe, no secrets) so Actions logs explain empty digests.
+        print(
             "[label] "
-            + f"{label_name!r}: fetched={fetched} keyword_filtered={keyword_filtered} gemini_skipped={gemini_skipped} kept={kept}"
+            + f"{label_name!r}: fetched={fetched} keyword_filtered={keyword_filtered} gemini_skipped={gemini_skipped} kept={kept}",
+            file=sys.stderr,
         )
         label_sections.append((label_name, rows))
 
