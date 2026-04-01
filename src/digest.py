@@ -31,6 +31,13 @@ class EmailItem:
     snippet: str
 
 
+@dataclass
+class ScoredSummary:
+    summary: str
+    relevance: int
+    urgency: str  # High | Medium | Low
+
+
 def _slack_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -209,17 +216,52 @@ def _summarise(
     cfg: dict[str, Any],
     model: Any,
     item: EmailItem,
-) -> str | None:
-    prompt = f"""You are writing for this reader persona: {cfg["persona"]}
+) -> ScoredSummary | None:
+    system_instructions = f"""You are an intelligent email digest assistant for a product manager. Your job is to monitor incoming emails, filter for signal over noise, summarise each one clearly, and deliver a structured daily digest that is fast to scan and easy to act on.
 
-Summarize the following email in 150–250 words. Focus on substance and actionable information.
+YOUR PERSONA & GOAL
+You think like a senior product manager. You prioritise:
+- Strategic insights, market trends, and competitive intelligence
+- Frameworks, case studies, and research findings
+- Actionable recommendations with clear next steps
+- Data points that inform product decisions
 
-If the email is purely promotional (e.g. generic sales, discounts, or marketing with no meaningful content for this reader), respond with exactly the single word SKIP (uppercase, no punctuation, no other text).
+You ruthlessly filter out noise. You never waste the PM's time.
 
-Email subject: {item.subject}
-From: {item.from_addr}
-Date: {item.date}
-Snippet / preview:
+FILTER: KEEP SIGNAL, DROP NOISE
+Discard an email (respond SKIP) if it is promotional, course/event sales, onboarding drip/cart abandonment, padding-heavy with no substance, or purely transactional.
+Keep emails that look like real editorial content, analysis, research, case studies, frameworks, insights, or prose with genuine ideas. When in doubt, KEEP.
+
+SUMMARISE EACH EMAIL
+For each kept email, produce a summary of 120–200 words:
+- Start with the core insight (no vague openers like \"this email discusses\")
+- Name specifics (frameworks, stats, companies, products, findings)
+- Extract PM-relevant value: what decision/action could this inform?
+- Flag if actionable
+- Plain, confident prose. No bullet points inside the summary.
+
+SCORE EACH EMAIL
+Also rate:
+- Relevance (1–5)
+- Urgency (High / Medium / Low)
+
+OUTPUT FORMAT (strict)
+- If you decide to discard: output exactly: SKIP
+- Otherwise output exactly 3 lines:
+Relevance: <1-5>
+Urgency: <High|Medium|Low>
+Summary: <single-paragraph 120-200 word summary>
+
+Reader persona: {cfg["persona"]}
+"""
+
+    prompt = f"""{system_instructions}
+
+Email details:
+Subject: {item.subject}
+Sender: {item.from_addr}
+Date received: {item.date}
+Snippet / body preview:
 {item.snippet}
 """
     try:
@@ -250,7 +292,18 @@ Snippet / preview:
 
     if re.match(r"^SKIP\s*$", text, re.IGNORECASE):
         return None
-    return text
+
+    rel_m = re.search(r"(?im)^\s*Relevance:\s*([1-5])\s*$", text)
+    urg_m = re.search(r"(?im)^\s*Urgency:\s*(High|Medium|Low)\s*$", text)
+    sum_m = re.search(r"(?im)^\s*Summary:\s*(.+)\s*$", text)
+    if not (rel_m and urg_m and sum_m):
+        # Fallback: treat full response as summary with default scores.
+        return ScoredSummary(summary=text.strip(), relevance=3, urgency="Low")
+
+    summary = sum_m.group(1).strip()
+    relevance = int(rel_m.group(1))
+    urgency = urg_m.group(1)
+    return ScoredSummary(summary=summary, relevance=relevance, urgency=urgency)
 
 
 def _gmail_open_url(thread_id: str) -> str:
@@ -258,7 +311,9 @@ def _gmail_open_url(thread_id: str) -> str:
 
 
 def _build_blocks(
-    label_sections: list[tuple[str, list[tuple[EmailItem, str]]]],
+    label_sections: list[tuple[str, list[tuple[EmailItem, ScoredSummary]]]],
+    *,
+    tldr_lines: list[str] | None = None,
     block_budget: int = 45,
 ) -> list[dict[str, Any]]:
     """Build Slack Block Kit payload (max 50 blocks per message)."""
@@ -295,16 +350,18 @@ def _build_blocks(
             continue
 
         omitted = 0
-        for idx, (item, summary) in enumerate(rows):
+        for idx, (item, scored) in enumerate(rows):
             if used + 1 > block_budget:
                 omitted = len(rows) - idx
                 break
             url = _gmail_open_url(item.thread_id)
+            urgency_dot = {"High": "🔴", "Medium": "🟡", "Low": "⚪"}.get(scored.urgency, "⚪")
             body = (
                 f"*Subject:* {_slack_escape(item.subject)}\n"
                 f"*From:* {_slack_escape(item.from_addr)}\n"
                 f"*Date:* {_slack_escape(item.date)}\n\n"
-                f"{_slack_escape(summary)}\n\n"
+                f"*Relevance:* {scored.relevance}/5   *Urgency:* {urgency_dot} {scored.urgency}\n\n"
+                f"{_slack_escape(scored.summary)}\n\n"
                 f"<{url}|Open in Gmail>"
             )
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": body}})
@@ -324,7 +381,43 @@ def _build_blocks(
             )
             used += 1
 
+    if tldr_lines and used + 2 <= block_budget:
+        blocks.append({"type": "divider"})
+        used += 1
+        blocks.append(
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": "TL;DR", "emoji": False},
+            }
+        )
+        used += 1
+        bullets = "\n".join(f"- {_slack_escape(x)}" for x in tldr_lines[:3] if x.strip())
+        if bullets and used + 1 <= block_budget:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": bullets}})
+            used += 1
+
     return blocks
+
+
+def _generate_tldr(model: Any, scored: list[tuple[str, EmailItem, ScoredSummary]]) -> list[str]:
+    if not scored:
+        return []
+    # Keep the prompt bounded to avoid huge token usage.
+    items = scored[:20]
+    joined = "\n\n".join(
+        f"Label: {label}\nSubject: {it.subject}\nFrom: {it.from_addr}\nSummary: {sc.summary}\nRelevance: {sc.relevance}/5 Urgency: {sc.urgency}"
+        for label, it, sc in items
+    )
+    prompt = f"""You are a PM chief-of-staff. Produce exactly 3 punchy takeaways (one sentence each) from this daily email digest.
+No preamble, no numbering. Output exactly 3 lines, each starting with \"- \".
+
+Digest items:
+{joined}
+"""
+    resp = model.generate_content(prompt, generation_config={"max_output_tokens": 256})
+    text = (getattr(resp, "text", "") or "").strip()
+    lines = [re.sub(r"^\s*[-•]\s*", "", ln).strip() for ln in text.splitlines() if ln.strip()]
+    return [ln for ln in lines if ln][:3]
 
 
 def _post_slack(webhook: str, blocks: list[dict[str, Any]]) -> bool:
@@ -365,7 +458,8 @@ def main() -> int:
         print(f"Gemini model init failed: {e}", file=sys.stderr)
         return 1
 
-    label_sections: list[tuple[str, list[tuple[EmailItem, str]]]] = []
+    label_sections: list[tuple[str, list[tuple[EmailItem, ScoredSummary]]]] = []
+    all_scored: list[tuple[str, EmailItem, ScoredSummary]] = []
 
     for label_name in cfg["labels"]:
         try:
@@ -382,7 +476,7 @@ def main() -> int:
             print(f"Gmail API error for label {label_name!r}: {e}", file=sys.stderr)
             return 1
 
-        rows: list[tuple[EmailItem, str]] = []
+        rows: list[tuple[EmailItem, ScoredSummary]] = []
         fetched = len(refs)
         keyword_filtered = 0
         gemini_skipped = 0
@@ -419,12 +513,13 @@ def main() -> int:
                 keyword_filtered += 1
                 _debug(f"[filter] keyword drop: {item.subject!r}")
                 continue
-            summary = _summarise(cfg, model, item)
-            if summary is None:
+            scored = _summarise(cfg, model, item)
+            if scored is None:
                 gemini_skipped += 1
                 _debug(f"[gemini] SKIP: {item.subject!r}")
                 continue
-            rows.append((item, summary))
+            rows.append((item, scored))
+            all_scored.append((label_name, item, scored))
             kept += 1
 
         # Always log aggregate counts (safe, no secrets) so Actions logs explain empty digests.
@@ -435,7 +530,13 @@ def main() -> int:
         )
         label_sections.append((label_name, rows))
 
-    blocks = _build_blocks(label_sections)
+    tldr = []
+    try:
+        tldr = _generate_tldr(model, all_scored)
+    except Exception as e:
+        _debug(f"[tldr] failed: {e}")
+
+    blocks = _build_blocks(label_sections, tldr_lines=tldr)
     try:
         if not _post_slack(cfg["slack_webhook"], blocks):
             return 1
