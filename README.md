@@ -127,6 +127,14 @@ All configuration is read from environment variables (loaded via `python-dotenv`
   - If `fetched=0`, increase `DATE_WINDOW_DAYS` temporarily or verify labels have recent mail.
 - **Some emails missing in Slack**: The script now splits posts across multiple Slack messages.
 - **Gmail label not found**: Ensure label names match Gmail exactly (case-insensitive, but spacing matters).
+- **`invalid_grant` / “Token has been expired or revoked”**: Your **Gmail OAuth refresh token** is no longer valid for Google’s token endpoint.
+  - **Fix**: Complete the OAuth consent flow again locally, copy the new **refresh token**, and update the `GMAIL_REFRESH_TOKEN` repository secret. Confirm `GMAIL_CLIENT_ID` and `GMAIL_CLIENT_SECRET` still match the same OAuth client in Google Cloud.
+  - **Why it happens** (you cannot fully “prevent” Google from invalidating tokens, but you can reduce surprises):
+    - You **revoked** the app under [Google Account → Third-party access](https://myaccount.google.com/permissions).
+    - The OAuth client **secret was regenerated** in Google Cloud Console.
+    - The OAuth consent screen is in **Testing** mode: refresh tokens for users outside your workspace can **expire after 7 days** unless you publish the app or use a supported long-lived setup for your use case.
+    - Google may invalidate older refresh tokens when **too many** are issued for the same user + OAuth client (typical limit is on the order of **50** per user per client).
+  - **FutureWarning about `google.generativeai`**: Harmless for now; the package is deprecated in favor of `google.genai`. Plan to migrate when convenient.
 
 ---
 

@@ -11,6 +11,7 @@ from typing import Any
 import google.generativeai as genai
 import requests
 from dotenv import load_dotenv
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -121,7 +122,22 @@ def _gmail_credentials(cfg: dict[str, Any]) -> Credentials:
         client_secret=cfg["gmail_client_secret"],
         scopes=GMAIL_SCOPES,
     )
-    creds.refresh(Request())
+    try:
+        creds.refresh(Request())
+    except RefreshError as e:
+        print(
+            "Gmail OAuth refresh failed (invalid_grant). The refresh token is no longer accepted.\n"
+            "What to do:\n"
+            "  1. Run your local OAuth flow again to obtain a new refresh token.\n"
+            "  2. Update GitHub Secrets: GMAIL_REFRESH_TOKEN (and verify GMAIL_CLIENT_ID / "
+            "GMAIL_CLIENT_SECRET match that OAuth client).\n"
+            "Common causes: you revoked app access in Google Account, the OAuth client secret was "
+            "rotated, the app is in OAuth 'Testing' mode (refresh tokens can expire for external "
+            "test users), or Google invalidated old tokens when issuing new ones.\n"
+            f"Underlying error: {e}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from e
     return creds
 
 
