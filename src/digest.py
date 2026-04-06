@@ -125,18 +125,37 @@ def _gmail_credentials(cfg: dict[str, Any]) -> Credentials:
     try:
         creds.refresh(Request())
     except RefreshError as e:
-        print(
-            "Gmail OAuth refresh failed (invalid_grant). The refresh token is no longer accepted.\n"
-            "What to do:\n"
-            "  1. Run your local OAuth flow again to obtain a new refresh token.\n"
-            "  2. Update GitHub Secrets: GMAIL_REFRESH_TOKEN (and verify GMAIL_CLIENT_ID / "
-            "GMAIL_CLIENT_SECRET match that OAuth client).\n"
-            "Common causes: you revoked app access in Google Account, the OAuth client secret was "
-            "rotated, the app is in OAuth 'Testing' mode (refresh tokens can expire for external "
-            "test users), or Google invalidated old tokens when issuing new ones.\n"
-            f"Underlying error: {e}",
-            file=sys.stderr,
-        )
+        err_txt = str(e).lower()
+        if "unauthorized_client" in err_txt:
+            print(
+                "Gmail OAuth refresh failed (unauthorized_client). Google rejected the client credentials.\n"
+                "This almost always means GMAIL_CLIENT_ID + GMAIL_CLIENT_SECRET + GMAIL_REFRESH_TOKEN "
+                "do not belong together.\n"
+                "What to do:\n"
+                "  1. In Google Cloud Console → APIs & Services → Credentials, open ONE OAuth 2.0 "
+                "Client ID (Desktop or Web).\n"
+                "  2. Copy that client's ID and secret into GitHub Secrets GMAIL_CLIENT_ID and "
+                "GMAIL_CLIENT_SECRET.\n"
+                "  3. Obtain a NEW refresh token using that same client (OAuth Playground or your "
+                "local script) and update GMAIL_REFRESH_TOKEN.\n"
+                "Do not mix: a refresh token from client A with secrets from client B. If you use "
+                "OAuth Playground, enable 'Use your own OAuth credentials' with the same client.\n"
+                f"Underlying error: {e}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Gmail OAuth refresh failed (invalid_grant). The refresh token is no longer accepted.\n"
+                "What to do:\n"
+                "  1. Run your local OAuth flow again to obtain a new refresh token.\n"
+                "  2. Update GitHub Secrets: GMAIL_REFRESH_TOKEN (and verify GMAIL_CLIENT_ID / "
+                "GMAIL_CLIENT_SECRET match that OAuth client).\n"
+                "Common causes: you revoked app access in Google Account, the OAuth client secret was "
+                "rotated, the app is in OAuth 'Testing' mode (refresh tokens can expire for external "
+                "test users), or Google invalidated old tokens when issuing new ones.\n"
+                f"Underlying error: {e}",
+                file=sys.stderr,
+            )
         raise SystemExit(1) from e
     return creds
 

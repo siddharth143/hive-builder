@@ -127,6 +127,7 @@ All configuration is read from environment variables (loaded via `python-dotenv`
   - If `fetched=0`, increase `DATE_WINDOW_DAYS` temporarily or verify labels have recent mail.
 - **Some emails missing in Slack**: The script now splits posts across multiple Slack messages.
 - **Gmail label not found**: Ensure label names match Gmail exactly (case-insensitive, but spacing matters).
+- **`unauthorized_client`**: The **refresh token and OAuth client do not match**. `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, and `GMAIL_REFRESH_TOKEN` must all come from the **same** OAuth 2.0 Client ID in Google Cloud. Re-issue the refresh token after fixing the client ID/secret (e.g. do not pair a token from OAuth Playground with a different client’s secrets).
 - **`invalid_grant` / “Token has been expired or revoked”**: Your **Gmail OAuth refresh token** is no longer valid for Google’s token endpoint.
   - **Fix**: Complete the OAuth consent flow again locally, copy the new **refresh token**, and update the `GMAIL_REFRESH_TOKEN` repository secret. Confirm `GMAIL_CLIENT_ID` and `GMAIL_CLIENT_SECRET` still match the same OAuth client in Google Cloud.
   - **Why it happens** (you cannot fully “prevent” Google from invalidating tokens, but you can reduce surprises):
