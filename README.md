@@ -105,6 +105,13 @@ cp .env.example .env
 python src/digest.py
 ```
 
+4. Run unit tests (optional):
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
 ---
 
 ## Configuration reference
@@ -135,7 +142,7 @@ All configuration is read from environment variables (loaded via `python-dotenv`
     - The OAuth client **secret was regenerated** in Google Cloud Console.
     - The OAuth consent screen is in **Testing** mode: refresh tokens for users outside your workspace can **expire after 7 days** unless you publish the app or use a supported long-lived setup for your use case.
     - Google may invalidate older refresh tokens when **too many** are issued for the same user + OAuth client (typical limit is on the order of **50** per user per client).
-  - **FutureWarning about `google.generativeai`**: Harmless for now; the package is deprecated in favor of `google.genai`. Plan to migrate when convenient.
+  - Summaries use the **`google-genai`** Python client (Gemini API).
 
 ---
 

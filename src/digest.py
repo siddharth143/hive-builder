@@ -5,22 +5,55 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
-import google.generativeai as genai
 import requests
 from dotenv import load_dotenv
+from google import genai
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
+from google.genai import errors as genai_errors
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+# ── Constants ──────────────────────────────────────────────────────────────────
 GMAIL_SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
 GMAIL_TOKEN_URI = "https://oauth2.googleapis.com/token"
+GMAIL_EXECUTE_RETRIES = 3       # built-in retry in googleapiclient .execute()
+
+GEMINI_MAX_OUTPUT_TOKENS = 2048
+GEMINI_TLDR_MAX_OUTPUT_TOKENS = 256
+GEMINI_MAX_WORKERS = 5          # concurrent summarisation threads
+GEMINI_RETRY_ATTEMPTS = 3       # per-call retry on transient errors
+GEMINI_RETRY_BACKOFF = 2.0      # exponential backoff base (seconds)
+
+SLACK_MAX_BLOCKS_PER_MSG = 49   # Slack hard-limits messages to 50 blocks
+SLACK_SUMMARY_MAX_CHARS = 700
+SLACK_TLDR_MAX_BULLETS = 3
+SLACK_RETRY_ATTEMPTS = 3
+SLACK_RETRY_BACKOFF = 2.0
+
+VALID_URGENCY: frozenset[str] = frozenset({"High", "Medium", "Low"})
+
 DEBUG = (os.environ.get("DEBUG") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
+# Exceptions that warrant a retry on Gemini calls (server-side / network).
+# ClientError (4xx, e.g. invalid API key) is intentionally excluded — retrying
+# won't help and would just delay the fatal exit.
+_RETRYABLE_GEMINI: tuple[type[BaseException], ...] = (
+    genai_errors.ServerError,
+    ConnectionError,
+    TimeoutError,
+    requests.exceptions.RequestException,
+)
+
+
+# ── Data types ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class EmailItem:
@@ -36,7 +69,7 @@ class EmailItem:
 class ScoredSummary:
     summary: str
     relevance: int
-    urgency: str  # High | Medium | Low
+    urgency: str  # "High" | "Medium" | "Low"
 
 
 @dataclass(frozen=True)
@@ -44,6 +77,8 @@ class GmailLabel:
     id: str
     name: str
 
+
+# ── Utilities ──────────────────────────────────────────────────────────────────
 
 def _slack_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -53,13 +88,41 @@ def _truncate(text: str, max_chars: int) -> str:
     t = (text or "").strip()
     if len(t) <= max_chars:
         return t
-    # Slack doesn't collapse long text; keep it scannable.
     return t[: max(0, max_chars - 1)].rstrip() + "…"
 
 
 def _parse_csv_env(raw: str) -> list[str]:
     return [p.strip() for p in raw.split(",") if p.strip()]
 
+
+def _debug(msg: str) -> None:
+    if DEBUG:
+        print(msg, file=sys.stderr)
+
+
+def _with_retry(
+    fn: Any,
+    *,
+    max_attempts: int,
+    backoff_base: float,
+    retryable: tuple[type[BaseException], ...],
+    label: str = "operation",
+) -> Any:
+    """Execute *fn()* up to *max_attempts* times, backing off on *retryable* exceptions."""
+    last_exc: BaseException | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except retryable as exc:
+            last_exc = exc
+            if attempt < max_attempts:
+                wait = backoff_base ** attempt
+                _debug(f"[retry] {label} attempt {attempt} failed ({exc!r}), retrying in {wait:.1f}s")
+                time.sleep(wait)
+    raise last_exc  # type: ignore[misc]
+
+
+# ── Config ─────────────────────────────────────────────────────────────────────
 
 def _load_config() -> dict[str, Any]:
     load_dotenv()
@@ -113,6 +176,8 @@ def _load_config() -> dict[str, Any]:
     }
 
 
+# ── Gmail ──────────────────────────────────────────────────────────────────────
+
 def _gmail_credentials(cfg: dict[str, Any]) -> Credentials:
     creds = Credentials(
         token=None,
@@ -161,7 +226,7 @@ def _gmail_credentials(cfg: dict[str, Any]) -> Credentials:
 
 
 def _list_gmail_labels(service: Any) -> list[GmailLabel]:
-    resp = service.users().labels().list(userId="me").execute()
+    resp = service.users().labels().list(userId="me").execute(num_retries=GMAIL_EXECUTE_RETRIES)
     out: list[GmailLabel] = []
     for lab in resp.get("labels", []):
         lid = (lab.get("id") or "").strip()
@@ -172,12 +237,7 @@ def _list_gmail_labels(service: Any) -> list[GmailLabel]:
 
 
 def _expand_label_family(labels: list[GmailLabel], parent_name: str) -> list[GmailLabel]:
-    """
-    Gmail supports hierarchical labels with '/' separators.
-    If parent_name is 'AI Product Management', include:
-      - 'AI Product Management'
-      - 'AI Product Management/...'
-    """
+    """Return the label matching *parent_name* and all its '/' sub-labels, sorted."""
     want = parent_name.strip()
     if not want:
         return []
@@ -203,11 +263,6 @@ def _matches_filter(subject: str, snippet: str, keywords: list[str]) -> bool:
     return any(k.lower() in hay for k in keywords)
 
 
-def _debug(msg: str) -> None:
-    if DEBUG:
-        print(msg, file=sys.stderr)
-
-
 def _list_message_refs(
     service: Any,
     label_id: str,
@@ -216,12 +271,12 @@ def _list_message_refs(
     max_count: int,
     include_spam_trash: bool = False,
 ) -> list[dict[str, str]]:
-    _debug(f"[gmail] list: label_id={label_id} q={(q or '')!r} max={max_count} include_spam_trash={include_spam_trash}")
+    _debug(f"[gmail] list: label_id={label_id} q={(q or '')!r} max={max_count}")
     refs: list[dict[str, str]] = []
     page_token: str | None = None
     while len(refs) < max_count:
         batch_size = min(500, max_count - len(refs))
-        req = (
+        resp = (
             service.users()
             .messages()
             .list(
@@ -232,8 +287,8 @@ def _list_message_refs(
                 pageToken=page_token,
                 includeSpamTrash=include_spam_trash,
             )
+            .execute(num_retries=GMAIL_EXECUTE_RETRIES)
         )
-        resp = req.execute()
         batch = resp.get("messages") or []
         if not batch:
             break
@@ -254,7 +309,7 @@ def _fetch_email_item(service: Any, msg_id: str) -> EmailItem:
             format="metadata",
             metadataHeaders=["From", "Subject", "Date"],
         )
-        .execute()
+        .execute(num_retries=GMAIL_EXECUTE_RETRIES)
     )
     headers = (msg.get("payload") or {}).get("headers") or []
     subject = _header(headers, "Subject") or "(no subject)"
@@ -262,8 +317,6 @@ def _fetch_email_item(service: Any, msg_id: str) -> EmailItem:
     date = _header(headers, "Date") or ""
     if not date and msg.get("internalDate"):
         try:
-            from datetime import datetime, timezone
-
             ms = int(msg["internalDate"])
             date = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         except (OSError, ValueError, TypeError):
@@ -279,11 +332,49 @@ def _fetch_email_item(service: Any, msg_id: str) -> EmailItem:
     )
 
 
-def _summarise(
-    cfg: dict[str, Any],
-    model: Any,
-    item: EmailItem,
-) -> ScoredSummary | None:
+# ── Gemini ─────────────────────────────────────────────────────────────────────
+
+def _parse_gemini_response(text: str) -> ScoredSummary | None:
+    """
+    Parse a Gemini summarisation response.
+
+    Returns ``None``  → Gemini decided to SKIP this email.
+    Returns ``ScoredSummary`` → parsed (or fallback) result.
+
+    Handles:
+    - Optional whitespace around the colon (``Relevance:3`` and ``Relevance: 3``)
+    - Case-insensitive urgency (``high`` → ``High``)
+    - Multi-line summaries
+    - Fallback to full-response-as-summary when structured fields are absent
+    """
+    stripped = text.strip()
+
+    if re.match(r"^SKIP\s*$", stripped, re.IGNORECASE):
+        return None
+
+    rel_m = re.search(r"(?im)^\s*Relevance\s*:\s*([1-5])\s*$", stripped)
+    urg_m = re.search(r"(?im)^\s*Urgency\s*:\s*(High|Medium|Low)\s*$", stripped, re.IGNORECASE)
+    # Capture first word(s) on the Summary line; everything after that line is
+    # also part of the summary (multi-line responses).
+    sum_m = re.search(r"(?im)^\s*Summary\s*:\s*(.+)", stripped)
+
+    if rel_m and urg_m and sum_m:
+        relevance = int(rel_m.group(1))  # regex already constrains to [1-5]
+        raw_urgency = urg_m.group(1).strip()
+        urgency = next(u for u in VALID_URGENCY if u.lower() == raw_urgency.lower())
+        # Take everything from after "Summary: " to end of string so multi-line
+        # summaries aren't truncated to just the first line.
+        trailing = stripped[sum_m.end():].strip()
+        summary = (sum_m.group(1).strip() + (" " + trailing if trailing else "")).strip()
+        return ScoredSummary(summary=summary, relevance=relevance, urgency=urgency)
+
+    # Fallback: treat full response as summary with neutral scores and log it so
+    # operators can tune the prompt if this happens frequently.
+    _debug(f"[gemini] structured parse failed — using full response as summary:\n{stripped[:200]}")
+    return ScoredSummary(summary=stripped, relevance=3, urgency="Low")
+
+
+def _build_summarise_prompt(cfg: dict[str, Any], item: EmailItem) -> str:
     system_instructions = f"""You are an intelligent email digest assistant for a product manager. Your job is to monitor incoming emails, filter for signal over noise, summarise each one clearly, and deliver a structured daily digest that is fast to scan and easy to act on.
 
 YOUR PERSONA & GOAL
@@ -301,7 +392,7 @@ Keep emails that look like real editorial content, analysis, research, case stud
 
 SUMMARISE EACH EMAIL
 For each kept email, produce a summary of 120–200 words:
-- Start with the core insight (no vague openers like \"this email discusses\")
+- Start with the core insight (no vague openers like "this email discusses")
 - Name specifics (frameworks, stats, companies, products, findings)
 - Extract PM-relevant value: what decision/action could this inform?
 - Flag if actionable
@@ -321,8 +412,7 @@ Summary: <single-paragraph 120-200 word summary>
 
 Reader persona: {cfg["persona"]}
 """
-
-    prompt = f"""{system_instructions}
+    return f"""{system_instructions}
 
 Email details:
 Subject: {item.subject}
@@ -331,47 +421,79 @@ Date received: {item.date}
 Snippet / body preview:
 {item.snippet}
 """
-    try:
-        resp = model.generate_content(
-            prompt,
-            generation_config={"max_output_tokens": 2048},
+
+
+def _summarise(
+    cfg: dict[str, Any],
+    client: genai.Client,
+    item: EmailItem,
+) -> ScoredSummary | None:
+    """
+    Call Gemini to score and summarise *item*.
+
+    Returns ``None`` if Gemini SKIPped the email.
+    Raises on API error after retries are exhausted (caller handles per-email).
+    """
+    prompt = _build_summarise_prompt(cfg, item)
+
+    def _call() -> Any:
+        return client.models.generate_content(
+            model=cfg["gemini_model"],
+            contents=prompt,
+            config={"max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS},
         )
-    except Exception as e:
-        print(f"Gemini API error: {e}", file=sys.stderr)
-        raise SystemExit(1) from e
 
-    text = ""
-    try:
-        text = (resp.text or "").strip()
-    except Exception:
-        text = ""
-    if not text and resp.candidates:
-        parts: list[str] = []
-        for c in resp.candidates:
-            content = getattr(c, "content", None)
-            if not content:
-                continue
-            for p in getattr(content, "parts", None) or []:
-                t = getattr(p, "text", None)
-                if t:
-                    parts.append(t)
-        text = "".join(parts).strip()
+    resp = _with_retry(
+        _call,
+        max_attempts=GEMINI_RETRY_ATTEMPTS,
+        backoff_base=GEMINI_RETRY_BACKOFF,
+        retryable=_RETRYABLE_GEMINI,
+        label=f"gemini/summarise {item.msg_id}",
+    )
+    text = (getattr(resp, "text", "") or "").strip()
+    return _parse_gemini_response(text)
 
-    if re.match(r"^SKIP\s*$", text, re.IGNORECASE):
-        return None
 
-    rel_m = re.search(r"(?im)^\s*Relevance:\s*([1-5])\s*$", text)
-    urg_m = re.search(r"(?im)^\s*Urgency:\s*(High|Medium|Low)\s*$", text)
-    sum_m = re.search(r"(?im)^\s*Summary:\s*(.+)\s*$", text)
-    if not (rel_m and urg_m and sum_m):
-        # Fallback: treat full response as summary with default scores.
-        return ScoredSummary(summary=text.strip(), relevance=3, urgency="Low")
+def _generate_tldr(
+    cfg: dict[str, Any],
+    client: genai.Client,
+    scored: list[tuple[str, EmailItem, ScoredSummary]],
+) -> list[str]:
+    if not scored:
+        return []
+    items = scored[:20]
+    joined = "\n\n".join(
+        f"Label: {label}\nSubject: {it.subject}\nFrom: {it.from_addr}\n"
+        f"Summary: {sc.summary}\nRelevance: {sc.relevance}/5 Urgency: {sc.urgency}"
+        for label, it, sc in items
+    )
+    prompt = (
+        'You are a PM chief-of-staff. Produce exactly 3 punchy takeaways (one sentence each) '
+        'from this daily email digest.\n'
+        'No preamble, no numbering. Output exactly 3 lines, each starting with "- ".\n\n'
+        f'Digest items:\n{joined}\n'
+    )
 
-    summary = sum_m.group(1).strip()
-    relevance = int(rel_m.group(1))
-    urgency = urg_m.group(1)
-    return ScoredSummary(summary=summary, relevance=relevance, urgency=urgency)
+    def _call() -> Any:
+        return client.models.generate_content(
+            model=cfg["gemini_model"],
+            contents=prompt,
+            config={"max_output_tokens": GEMINI_TLDR_MAX_OUTPUT_TOKENS},
+        )
 
+    resp = _with_retry(
+        _call,
+        max_attempts=GEMINI_RETRY_ATTEMPTS,
+        backoff_base=GEMINI_RETRY_BACKOFF,
+        retryable=_RETRYABLE_GEMINI,
+        label="gemini/tldr",
+    )
+    text = (getattr(resp, "text", "") or "").strip()
+    lines = [re.sub(r"^\s*[-•]\s*", "", ln).strip() for ln in text.splitlines() if ln.strip()]
+    return [ln for ln in lines if ln][:SLACK_TLDR_MAX_BULLETS]
+
+
+# ── Slack ──────────────────────────────────────────────────────────────────────
 
 def _gmail_open_url(thread_id: str) -> str:
     return f"https://mail.google.com/mail/u/0/#all/{thread_id}"
@@ -387,7 +509,10 @@ def _digest_header_blocks(*, title_suffix: str | None = None) -> list[dict[str, 
 
 def _label_header_block(label_name: str, *, continued: bool) -> dict[str, Any]:
     suffix = " (cont.)" if continued else ""
-    return {"type": "header", "text": {"type": "plain_text", "text": f"Label: {label_name}{suffix}", "emoji": False}}
+    return {
+        "type": "header",
+        "text": {"type": "plain_text", "text": f"Label: {label_name}{suffix}", "emoji": False},
+    }
 
 
 def _email_card_blocks(item: EmailItem, scored: ScoredSummary, source_label: str) -> list[dict[str, Any]]:
@@ -402,11 +527,29 @@ def _email_card_blocks(item: EmailItem, scored: ScoredSummary, source_label: str
                 {"type": "mrkdwn", "text": f"*From*\n{_slack_escape(item.from_addr)}"},
                 {"type": "mrkdwn", "text": f"*Date*\n{_slack_escape(item.date)}"},
                 {"type": "mrkdwn", "text": f"*Sublabel*\n{_slack_escape(source_label)}"},
-                {"type": "mrkdwn", "text": f"*Score*\nRelevance {scored.relevance}/5 · {urgency_dot} {scored.urgency}"},
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Score*\nRelevance {scored.relevance}/5 · {urgency_dot} {scored.urgency}",
+                },
             ],
         },
-        {"type": "section", "text": {"type": "mrkdwn", "text": _slack_escape(_truncate(scored.summary, 700))}},
-        {"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "Open in Gmail"}, "url": url}]},
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": _slack_escape(_truncate(scored.summary, SLACK_SUMMARY_MAX_CHARS)),
+            },
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Open in Gmail"},
+                    "url": url,
+                }
+            ],
+        },
     ]
 
 
@@ -414,12 +557,9 @@ def _build_slack_messages(
     label_sections: list[tuple[str, list[tuple[EmailItem, ScoredSummary, str]]]],
     *,
     tldr_lines: list[str] | None = None,
-    max_blocks_per_message: int = 49,
+    max_blocks_per_message: int = SLACK_MAX_BLOCKS_PER_MSG,
 ) -> list[list[dict[str, Any]]]:
-    """
-    Slack hard-limits blocks to 50 per message.
-    We split the digest into multiple messages instead of omitting emails.
-    """
+    """Split the digest into Slack messages that each fit within the 50-block limit."""
     messages: list[list[dict[str, Any]]] = []
     blocks: list[dict[str, Any]] = _digest_header_blocks()
 
@@ -433,12 +573,16 @@ def _build_slack_messages(
         label_started = False
         continued = False
 
-        # Even if empty, show the header + placeholder.
         if not rows:
             if len(blocks) + 2 > max_blocks_per_message:
                 flush()
             blocks.append(_label_header_block(label_name, continued=False))
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "_No qualifying emails for this period._"}})
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": "_No qualifying emails for this period._"},
+                }
+            )
             continue
 
         for item, scored, source_label in rows:
@@ -459,10 +603,11 @@ def _build_slack_messages(
             {"type": "divider"},
             {"type": "header", "text": {"type": "plain_text", "text": "TL;DR", "emoji": False}},
         ]
-        bullets = "\n".join(f"- {_slack_escape(x)}" for x in tldr_lines[:3] if x.strip())
+        bullets = "\n".join(
+            f"- {_slack_escape(x)}" for x in tldr_lines[:SLACK_TLDR_MAX_BULLETS] if x.strip()
+        )
         if bullets:
             tldr_blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": bullets}})
-        # If it doesn't fit, put TL;DR in a new message.
         if len(blocks) + len(tldr_blocks) > max_blocks_per_message:
             flush()
         blocks.extend(tldr_blocks)
@@ -472,64 +617,67 @@ def _build_slack_messages(
     return messages
 
 
-def _generate_tldr(model: Any, scored: list[tuple[str, EmailItem, ScoredSummary]]) -> list[str]:
-    if not scored:
-        return []
-    # Keep the prompt bounded to avoid huge token usage.
-    items = scored[:20]
-    joined = "\n\n".join(
-        f"Label: {label}\nSubject: {it.subject}\nFrom: {it.from_addr}\nSummary: {sc.summary}\nRelevance: {sc.relevance}/5 Urgency: {sc.urgency}"
-        for label, it, sc in items
-    )
-    prompt = f"""You are a PM chief-of-staff. Produce exactly 3 punchy takeaways (one sentence each) from this daily email digest.
-No preamble, no numbering. Output exactly 3 lines, each starting with \"- \".
-
-Digest items:
-{joined}
-"""
-    resp = model.generate_content(prompt, generation_config={"max_output_tokens": 256})
-    text = (getattr(resp, "text", "") or "").strip()
-    lines = [re.sub(r"^\s*[-•]\s*", "", ln).strip() for ln in text.splitlines() if ln.strip()]
-    return [ln for ln in lines if ln][:3]
-
-
 def _post_slack(webhook: str, blocks: list[dict[str, Any]]) -> bool:
-    r = requests.post(
-        webhook,
-        json={"blocks": blocks},
-        headers={"Content-Type": "application/json"},
-        timeout=60,
-    )
+    """
+    Post *blocks* to Slack.
+
+    Retries on 5xx errors and network failures with exponential backoff.
+    Returns ``False`` (without retrying) on 4xx errors — those indicate a
+    misconfigured webhook and won't improve on retry.
+    """
+
+    def _do_post() -> requests.Response:
+        r = requests.post(
+            webhook,
+            json={"blocks": blocks},
+            headers={"Content-Type": "application/json"},
+            timeout=60,
+        )
+        if r.status_code >= 500:
+            # Raise so _with_retry treats this as a retryable failure.
+            raise requests.exceptions.RequestException(
+                f"Slack server error {r.status_code}: {r.text}"
+            )
+        return r
+
+    try:
+        r = _with_retry(
+            _do_post,
+            max_attempts=SLACK_RETRY_ATTEMPTS,
+            backoff_base=SLACK_RETRY_BACKOFF,
+            retryable=(requests.exceptions.RequestException,),
+            label="slack/post",
+        )
+    except requests.exceptions.RequestException as e:
+        print(f"Slack request failed after {SLACK_RETRY_ATTEMPTS} attempts: {e}", file=sys.stderr)
+        return False
+
     if r.status_code >= 400:
         print(f"Slack webhook error {r.status_code}: {r.text}", file=sys.stderr)
         return False
     return True
 
 
+# ── Orchestration ──────────────────────────────────────────────────────────────
+
 def main() -> int:
     cfg = _load_config()
     print(
         "[config] "
         + f"labels={cfg['labels']!r} date_window_days={cfg['date_window_days']} "
-        + f"max_emails_per_label={cfg['max_emails_per_label']} filter_keywords={len(cfg['filter_keywords'])}",
+        + f"max_emails_per_label={cfg['max_emails_per_label']} "
+        + f"filter_keywords={len(cfg['filter_keywords'])}",
         file=sys.stderr,
     )
+
     try:
         creds = _gmail_credentials(cfg)
         service = build("gmail", "v1", credentials=creds, cache_discovery=False)
     except HttpError as e:
         print(f"Gmail API error: {e}", file=sys.stderr)
         return 1
-    except Exception as e:
-        print(f"Gmail setup failed: {e}", file=sys.stderr)
-        return 1
 
-    genai.configure(api_key=cfg["gemini_api_key"])
-    try:
-        model = genai.GenerativeModel(cfg["gemini_model"])
-    except Exception as e:
-        print(f"Gemini model init failed: {e}", file=sys.stderr)
-        return 1
+    gemini_client = genai.Client(api_key=cfg["gemini_api_key"])
 
     try:
         all_labels = _list_gmail_labels(service)
@@ -562,11 +710,7 @@ def main() -> int:
             refs_with_source.extend((r, lab.name) for r in refs)
             remaining -= len(refs)
 
-        rows: list[tuple[EmailItem, ScoredSummary, str]] = []
         fetched = len(refs_with_source)
-        keyword_filtered = 0
-        gemini_skipped = 0
-        kept = 0
 
         if fetched == 0:
             try:
@@ -578,19 +722,29 @@ def main() -> int:
                         break
                 print(
                     "[label-check] "
-                    + f"{parent_label!r}: any_in_label_family={any_in_family} (no date filter, includes sublabels)",
+                    + f"{parent_label!r}: any_in_label_family={any_in_family} "
+                    + "(no date filter, includes sublabels)",
                     file=sys.stderr,
                 )
             except HttpError as e:
                 print(f"Gmail API error during label-check for {parent_label!r}: {e}", file=sys.stderr)
                 return 1
 
+        # Deduplicate before issuing any email-detail API calls so we don't
+        # fetch the same message twice when it appears in both a parent label
+        # and a child label.
         seen_msg_ids: set[str] = set()
+        deduped: list[tuple[str, str]] = []  # (msg_id, source_label_name)
         for ref, source_label_name in refs_with_source:
             mid = ref.get("id")
-            if not mid or mid in seen_msg_ids:
-                continue
-            seen_msg_ids.add(mid)
+            if mid and mid not in seen_msg_ids:
+                seen_msg_ids.add(mid)
+                deduped.append((mid, source_label_name))
+
+        # Fetch email metadata (fast, serial — each call is a tiny metadata GET).
+        keyword_filtered = 0
+        items_to_summarise: list[tuple[EmailItem, str]] = []
+        for mid, source_label_name in deduped:
             try:
                 item = _fetch_email_item(service, mid)
             except HttpError as e:
@@ -600,38 +754,57 @@ def main() -> int:
                 keyword_filtered += 1
                 _debug(f"[filter] keyword drop: {item.subject!r}")
                 continue
-            scored = _summarise(cfg, model, item)
-            if scored is None:
-                gemini_skipped += 1
-                _debug(f"[gemini] SKIP: {item.subject!r}")
-                continue
-            rows.append((item, scored, source_label_name))
-            all_scored.append((parent_label, item, scored))
-            kept += 1
+            items_to_summarise.append((item, source_label_name))
 
+        # Parallel Gemini summarisation — each email is an independent API call
+        # so we saturate the quota allowance instead of waiting serially.
+        gemini_skipped = 0
+        gemini_errors = 0
+        rows: list[tuple[EmailItem, ScoredSummary, str]] = []
+
+        with ThreadPoolExecutor(max_workers=GEMINI_MAX_WORKERS) as executor:
+            futures = [
+                executor.submit(_summarise, cfg, gemini_client, item)
+                for item, _ in items_to_summarise
+            ]
+            for future, (item, source_label_name) in zip(futures, items_to_summarise):
+                try:
+                    scored = future.result()
+                except Exception as e:
+                    print(f"Gemini error for {item.subject!r}: {e}", file=sys.stderr)
+                    gemini_errors += 1
+                    continue
+                if scored is None:
+                    gemini_skipped += 1
+                    _debug(f"[gemini] SKIP: {item.subject!r}")
+                    continue
+                rows.append((item, scored, source_label_name))
+                all_scored.append((parent_label, item, scored))
+
+        kept = len(rows)
         print(
             "[label] "
-            + f"{parent_label!r}: fetched={fetched} keyword_filtered={keyword_filtered} gemini_skipped={gemini_skipped} kept={kept} "
-            + f"labels_included={len(family)}",
+            + f"{parent_label!r}: fetched={fetched} deduped={len(deduped)} "
+            + f"keyword_filtered={keyword_filtered} gemini_skipped={gemini_skipped} "
+            + f"gemini_errors={gemini_errors} kept={kept} labels_included={len(family)}",
             file=sys.stderr,
         )
         label_sections.append((parent_label, rows))
 
-    tldr = []
-    try:
-        tldr = _generate_tldr(model, all_scored)
-    except Exception as e:
-        _debug(f"[tldr] failed: {e}")
+    # Only attempt TL;DR when there are scored emails — avoids a wasted API
+    # call on days with no qualifying content.
+    tldr: list[str] = []
+    if all_scored:
+        try:
+            tldr = _generate_tldr(cfg, gemini_client, all_scored)
+        except Exception as e:
+            _debug(f"[tldr] failed: {e}")
 
     messages = _build_slack_messages(label_sections, tldr_lines=tldr)
-    try:
-        for i, blocks in enumerate(messages, start=1):
-            _debug(f"[slack] posting message {i}/{len(messages)} blocks={len(blocks)}")
-            if not _post_slack(cfg["slack_webhook"], blocks):
-                return 1
-    except requests.RequestException as e:
-        print(f"Slack request failed: {e}", file=sys.stderr)
-        return 1
+    for i, blocks in enumerate(messages, start=1):
+        _debug(f"[slack] posting message {i}/{len(messages)} blocks={len(blocks)}")
+        if not _post_slack(cfg["slack_webhook"], blocks):
+            return 1
 
     return 0
 
