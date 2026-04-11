@@ -1,5 +1,6 @@
 .env
 .env.*
+!.env.example
 .venv/
 .venv-ci/
 venv/
@@ -9,6 +10,10 @@ env/
 
 credentials.json
 token.json
+client_secret*.json
+*service-account*.json
+*.pem
+*.p12
 get_token.py
 __pycache__/
 *.pyc
