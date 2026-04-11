@@ -20,8 +20,9 @@ jobs:
       GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
       SUMMARISATION_PERSONA: ${{ secrets.SUMMARISATION_PERSONA }}
       FILTER_KEYWORDS: ${{ secrets.FILTER_KEYWORDS }}
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       MAX_EMAILS_PER_LABEL: ${{ secrets.MAX_EMAILS_PER_LABEL }}
+      DROPBOX_ACCESS_TOKEN: ${{ secrets.DROPBOX_ACCESS_TOKEN }}
+      DROPBOX_FOLDER_PATH: ${{ secrets.DROPBOX_FOLDER_PATH }}
       DEBUG: ${{ secrets.DEBUG }}
     steps:
       - uses: actions/checkout@v4

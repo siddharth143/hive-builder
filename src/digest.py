@@ -1,7 +1,9 @@
-"""Gmail label digest: fetch, filter, summarise with Gemini, post to Slack."""
+"""Gmail label digest: fetch, filter, summarise with Gemini, upload Markdown brief to Dropbox."""
 
 from __future__ import annotations
 
+import base64
+import html as html_module
 import os
 import re
 import sys
@@ -9,10 +11,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
+import dropbox as dropbox_sdk
 import requests
 from dotenv import load_dotenv
+from dropbox.exceptions import ApiError, AuthError
+from dropbox.files import WriteMode
 from google import genai
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
@@ -27,24 +33,19 @@ GMAIL_TOKEN_URI = "https://oauth2.googleapis.com/token"
 GMAIL_EXECUTE_RETRIES = 3       # built-in retry in googleapiclient .execute()
 
 GEMINI_MAX_OUTPUT_TOKENS = 2048
-GEMINI_TLDR_MAX_OUTPUT_TOKENS = 256
 GEMINI_MAX_WORKERS = 5          # concurrent summarisation threads
 GEMINI_RETRY_ATTEMPTS = 3       # per-call retry on transient errors
 GEMINI_RETRY_BACKOFF = 2.0      # exponential backoff base (seconds)
 
-SLACK_MAX_BLOCKS_PER_MSG = 49   # Slack hard-limits messages to 50 blocks
-SLACK_SUMMARY_MAX_CHARS = 700
-SLACK_TLDR_MAX_BULLETS = 3
-SLACK_RETRY_ATTEMPTS = 3
-SLACK_RETRY_BACKOFF = 2.0
+DROPBOX_RETRY_ATTEMPTS = 3
+DROPBOX_RETRY_BACKOFF = 2.0
+
+MAX_BODY_CHARS = 6000           # max email body chars forwarded to Gemini
 
 VALID_URGENCY: frozenset[str] = frozenset({"High", "Medium", "Low"})
 
 DEBUG = (os.environ.get("DEBUG") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
-# Exceptions that warrant a retry on Gemini calls (server-side / network).
-# ClientError (4xx, e.g. invalid API key) is intentionally excluded — retrying
-# won't help and would just delay the fatal exit.
 _RETRYABLE_GEMINI: tuple[type[BaseException], ...] = (
     genai_errors.ServerError,
     ConnectionError,
@@ -62,14 +63,18 @@ class EmailItem:
     subject: str
     from_addr: str
     date: str
-    snippet: str
+    snippet: str        # short preview — used for keyword filtering only
+    body: str           # full body text — used for Gemini summarisation
 
 
 @dataclass
 class ScoredSummary:
-    summary: str
-    relevance: int
-    urgency: str  # "High" | "Medium" | "Low"
+    headline: str       # AI one-liner title
+    tldr: str           # 1-2 sentence high-level summary
+    main_points: list   # key bullet points
+    topics: list        # topic hashtags e.g. ['#prompt-engineering']
+    companies: list     # company hashtags e.g. ['#openai']
+    urgency: str        # "High" | "Medium" | "Low"
 
 
 @dataclass(frozen=True)
@@ -79,10 +84,6 @@ class GmailLabel:
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
-
-def _slack_escape(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
 
 def _truncate(text: str, max_chars: int) -> str:
     t = (text or "").strip()
@@ -122,6 +123,110 @@ def _with_retry(
     raise last_exc  # type: ignore[misc]
 
 
+def _extract_display_name(from_addr: str) -> str:
+    """Extract display name from 'Name <email@domain>' format, else return raw."""
+    m = re.match(r'^"?([^"<]+?)"?\s*<[^>]+>$', from_addr.strip())
+    if m:
+        return m.group(1).strip()
+    return from_addr.strip()
+
+
+def _normalize_date(raw: str) -> str:
+    """Normalize RFC 2822 date header to 'D Mon YYYY' (e.g. '11 Apr 2026')."""
+    try:
+        dt = parsedate_to_datetime(raw.strip())
+        return f"{dt.day} {dt.strftime('%b %Y')}"
+    except Exception:
+        return raw
+
+
+def _parse_hashtags(raw: str) -> list[str]:
+    """Extract and normalize hashtag tokens from a Gemini output field value."""
+    raw = raw.strip()
+    if raw.lower() in ("none", "n/a", "-", ""):
+        return []
+    tokens = re.split(r"[,;\s]+", raw)
+    result: list[str] = []
+    for token in tokens:
+        token = token.strip().lstrip("#").strip(".,;:")
+        if not token or token.lower() in ("none", "n/a"):
+            continue
+        # Normalize to lowercase-hyphenated, strip non-alphanumeric except hyphens
+        normalized = re.sub(r"[\s_]+", "-", token.lower())
+        normalized = re.sub(r"[^a-z0-9\-]", "", normalized)
+        if normalized:
+            result.append(f"#{normalized}")
+    return result
+
+
+# ── Email body extraction ──────────────────────────────────────────────────────
+
+def _strip_html(raw: str) -> str:
+    """Strip HTML tags and decode entities to readable plain text."""
+    raw = re.sub(r"<style[^>]*>.*?</style>", " ", raw, flags=re.DOTALL | re.IGNORECASE)
+    raw = re.sub(r"<script[^>]*>.*?</script>", " ", raw, flags=re.DOTALL | re.IGNORECASE)
+    # Convert block elements to newlines for readability
+    raw = re.sub(r"<(?:br|p|div|h[1-6]|li|tr)[^>]*>", "\n", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    raw = html_module.unescape(raw)
+    raw = re.sub(r"[ \t]+", " ", raw)
+    raw = re.sub(r"\n{3,}", "\n\n", raw)
+    return raw.strip()
+
+
+def _extract_body_text(payload: dict, depth: int = 0) -> str:
+    """Recursively extract plain text from a Gmail message payload (MIME tree)."""
+    if depth > 5:
+        return ""
+    mime_type = (payload.get("mimeType") or "").lower()
+    body_data = (payload.get("body") or {}).get("data", "")
+
+    # Leaf node with content
+    if body_data and "parts" not in payload:
+        try:
+            text = base64.urlsafe_b64decode(body_data + "==").decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+        return _strip_html(text) if "html" in mime_type else text.strip()
+
+    parts = payload.get("parts") or []
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
+
+    for part in parts:
+        part_mime = (part.get("mimeType") or "").lower()
+        if any(x in part_mime for x in ("alternative", "mixed", "related")):
+            nested = _extract_body_text(part, depth + 1)
+            if nested:
+                plain_parts.append(nested)
+        elif "plain" in part_mime:
+            data = (part.get("body") or {}).get("data", "")
+            if data:
+                try:
+                    t = base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace").strip()
+                    if t:
+                        plain_parts.append(t)
+                except Exception:
+                    pass
+        elif "html" in part_mime:
+            data = (part.get("body") or {}).get("data", "")
+            if data:
+                try:
+                    t = _strip_html(
+                        base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
+                    )
+                    if t:
+                        html_parts.append(t)
+                except Exception:
+                    pass
+        elif "parts" in part:
+            nested = _extract_body_text(part, depth + 1)
+            if nested:
+                plain_parts.append(nested)
+
+    return "\n\n".join(plain_parts) or "\n\n".join(html_parts)
+
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 def _load_config() -> dict[str, Any]:
@@ -137,7 +242,8 @@ def _load_config() -> dict[str, Any]:
             "GEMINI_API_KEY",
             "GEMINI_MODEL",
             "SUMMARISATION_PERSONA",
-            "SLACK_WEBHOOK_URL",
+            "DROPBOX_ACCESS_TOKEN",
+            "DROPBOX_FOLDER_PATH",
         )
         if not (os.environ.get(k) or "").strip()
     ]
@@ -171,7 +277,8 @@ def _load_config() -> dict[str, Any]:
         "gemini_api_key": os.environ["GEMINI_API_KEY"].strip(),
         "gemini_model": os.environ["GEMINI_MODEL"].strip(),
         "persona": os.environ["SUMMARISATION_PERSONA"].strip(),
-        "slack_webhook": os.environ["SLACK_WEBHOOK_URL"].strip(),
+        "dropbox_access_token": os.environ["DROPBOX_ACCESS_TOKEN"].strip(),
+        "dropbox_folder_path": os.environ["DROPBOX_FOLDER_PATH"].strip().rstrip("/"),
         "max_emails_per_label": max_emails,
     }
 
@@ -203,8 +310,7 @@ def _gmail_credentials(cfg: dict[str, Any]) -> Credentials:
                 "GMAIL_CLIENT_SECRET.\n"
                 "  3. Obtain a NEW refresh token using that same client (OAuth Playground or your "
                 "local script) and update GMAIL_REFRESH_TOKEN.\n"
-                "Do not mix: a refresh token from client A with secrets from client B. If you use "
-                "OAuth Playground, enable 'Use your own OAuth credentials' with the same client.\n"
+                "Do not mix: a refresh token from client A with secrets from client B.\n"
                 f"Underlying error: {e}",
                 file=sys.stderr,
             )
@@ -215,9 +321,6 @@ def _gmail_credentials(cfg: dict[str, Any]) -> Credentials:
                 "  1. Run your local OAuth flow again to obtain a new refresh token.\n"
                 "  2. Update GitHub Secrets: GMAIL_REFRESH_TOKEN (and verify GMAIL_CLIENT_ID / "
                 "GMAIL_CLIENT_SECRET match that OAuth client).\n"
-                "Common causes: you revoked app access in Google Account, the OAuth client secret was "
-                "rotated, the app is in OAuth 'Testing' mode (refresh tokens can expire for external "
-                "test users), or Google invalidated old tokens when issuing new ones.\n"
                 f"Underlying error: {e}",
                 file=sys.stderr,
             )
@@ -256,10 +359,10 @@ def _header(headers: list[dict[str, str]], want: str) -> str:
     return ""
 
 
-def _matches_filter(subject: str, snippet: str, keywords: list[str]) -> bool:
+def _matches_filter(subject: str, body: str, keywords: list[str]) -> bool:
     if not keywords:
         return False
-    hay = f"{subject}\n{snippet}".lower()
+    hay = f"{subject}\n{body}".lower()
     return any(k.lower() in hay for k in keywords)
 
 
@@ -303,12 +406,7 @@ def _fetch_email_item(service: Any, msg_id: str) -> EmailItem:
     msg = (
         service.users()
         .messages()
-        .get(
-            userId="me",
-            id=msg_id,
-            format="metadata",
-            metadataHeaders=["From", "Subject", "Date"],
-        )
+        .get(userId="me", id=msg_id, format="full")
         .execute(num_retries=GMAIL_EXECUTE_RETRIES)
     )
     headers = (msg.get("payload") or {}).get("headers") or []
@@ -321,7 +419,15 @@ def _fetch_email_item(service: Any, msg_id: str) -> EmailItem:
             date = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         except (OSError, ValueError, TypeError):
             date = ""
+
     snippet = (msg.get("snippet") or "").strip()
+
+    body = _extract_body_text(msg.get("payload") or {})
+    if not body:
+        body = snippet
+    else:
+        body = body[:MAX_BODY_CHARS]
+
     return EmailItem(
         msg_id=msg_id,
         thread_id=msg.get("threadId") or msg_id,
@@ -329,6 +435,7 @@ def _fetch_email_item(service: Any, msg_id: str) -> EmailItem:
         from_addr=from_addr,
         date=date,
         snippet=snippet,
+        body=body,
     )
 
 
@@ -338,88 +445,133 @@ def _parse_gemini_response(text: str) -> ScoredSummary | None:
     """
     Parse a Gemini summarisation response.
 
-    Returns ``None``  → Gemini decided to SKIP this email.
+    Returns ``None``          → Gemini decided to SKIP this email.
     Returns ``ScoredSummary`` → parsed (or fallback) result.
 
-    Handles:
-    - Optional whitespace around the colon (``Relevance:3`` and ``Relevance: 3``)
-    - Case-insensitive urgency (``high`` → ``High``)
-    - Multi-line summaries
-    - Fallback to full-response-as-summary when structured fields are absent
+    Expected format:
+        Headline: <text>
+        TL;DR: <text>
+        Main Points:
+        - point 1
+        - point 2
+        Topic: #tag1 #tag2 or None
+        Company: #tag1 or None
+        Urgency: High|Medium|Low
     """
     stripped = text.strip()
 
     if re.match(r"^SKIP\s*$", stripped, re.IGNORECASE):
         return None
 
-    rel_m = re.search(r"(?im)^\s*Relevance\s*:\s*([1-5])\s*$", stripped)
+    head_m = re.search(r"(?im)^\s*Headline\s*:\s*(.+)", stripped)
+    # TL;DR: from field value up to "Main Points:" or end
+    tldr_m = re.search(
+        r"(?im)^\s*TL;?DR\s*:\s*(.+?)(?=^\s*Main\s+Points\s*:|\Z)",
+        stripped,
+        re.DOTALL | re.MULTILINE,
+    )
+    # Main Points: from section header up to "Topic:" or end
+    points_m = re.search(
+        r"(?im)^\s*Main\s+Points\s*:\s*\n(.*?)(?=^\s*Topic\s*:|\Z)",
+        stripped,
+        re.DOTALL | re.MULTILINE,
+    )
+    topic_m = re.search(r"(?im)^\s*Topic\s*:\s*(.+)", stripped)
+    company_m = re.search(r"(?im)^\s*Company\s*:\s*(.+)", stripped)
     urg_m = re.search(r"(?im)^\s*Urgency\s*:\s*(High|Medium|Low)\s*$", stripped, re.IGNORECASE)
-    # Capture first word(s) on the Summary line; everything after that line is
-    # also part of the summary (multi-line responses).
-    sum_m = re.search(r"(?im)^\s*Summary\s*:\s*(.+)", stripped)
 
-    if rel_m and urg_m and sum_m:
-        relevance = int(rel_m.group(1))  # regex already constrains to [1-5]
+    if head_m and tldr_m and urg_m:
         raw_urgency = urg_m.group(1).strip()
         urgency = next(u for u in VALID_URGENCY if u.lower() == raw_urgency.lower())
-        # Take everything from after "Summary: " to end of string so multi-line
-        # summaries aren't truncated to just the first line.
-        trailing = stripped[sum_m.end():].strip()
-        summary = (sum_m.group(1).strip() + (" " + trailing if trailing else "")).strip()
-        return ScoredSummary(summary=summary, relevance=relevance, urgency=urgency)
+        headline = head_m.group(1).strip()
+        tldr = tldr_m.group(1).strip()
 
-    # Fallback: treat full response as summary with neutral scores and log it so
-    # operators can tune the prompt if this happens frequently.
-    _debug(f"[gemini] structured parse failed — using full response as summary:\n{stripped[:200]}")
-    return ScoredSummary(summary=stripped, relevance=3, urgency="Low")
+        main_points: list[str] = []
+        if points_m:
+            main_points = [
+                re.sub(r"^\s*[-•*]\s*", "", line).strip()
+                for line in points_m.group(1).splitlines()
+                if re.match(r"\s*[-•*]", line) and line.strip()
+            ]
+
+        topics = _parse_hashtags(topic_m.group(1)) if topic_m else []
+        companies = _parse_hashtags(company_m.group(1)) if company_m else []
+
+        return ScoredSummary(
+            headline=headline,
+            tldr=tldr,
+            main_points=main_points,
+            topics=topics,
+            companies=companies,
+            urgency=urgency,
+        )
+
+    # Fallback: first non-empty line as headline, full text as TL;DR
+    _debug(f"[gemini] structured parse failed — using fallback:\n{stripped[:200]}")
+    first_line = next((ln.strip() for ln in stripped.splitlines() if ln.strip()), stripped)
+    return ScoredSummary(
+        headline=first_line[:100],
+        tldr=stripped,
+        main_points=[],
+        topics=[],
+        companies=[],
+        urgency="Low",
+    )
 
 
 def _build_summarise_prompt(cfg: dict[str, Any], item: EmailItem) -> str:
-    system_instructions = f"""You are an intelligent email digest assistant for a product manager. Your job is to monitor incoming emails, filter for signal over noise, summarise each one clearly, and deliver a structured daily digest that is fast to scan and easy to act on.
+    return f"""You are a senior product manager's daily briefing assistant. Read the email below and produce a structured summary or discard it.
 
-YOUR PERSONA & GOAL
-You think like a senior product manager. You prioritise:
-- Strategic insights, market trends, and competitive intelligence
-- Frameworks, case studies, and research findings
-- Actionable recommendations with clear next steps
-- Data points that inform product decisions
+PERSONA
+Think like a senior PM. Prioritise: strategic insights, market trends, competitive intelligence, frameworks with real case studies, actionable data points. Ruthlessly filter noise.
 
-You ruthlessly filter out noise. You never waste the PM's time.
+DISCARD RULE
+Output the single word SKIP — nothing else — if the email is:
+- Purely promotional, course/event sales, or cart abandonment
+- Onboarding drip with no substantive editorial content
+- Transactional (receipts, notifications, confirmations)
+When in doubt, keep it.
 
-FILTER: KEEP SIGNAL, DROP NOISE
-Discard an email (respond SKIP) if it is promotional, course/event sales, onboarding drip/cart abandonment, padding-heavy with no substance, or purely transactional.
-Keep emails that look like real editorial content, analysis, research, case studies, frameworks, insights, or prose with genuine ideas. When in doubt, KEEP.
+SUMMARISE RULE
+For emails you keep, produce all six fields below.
 
-SUMMARISE EACH EMAIL
-For each kept email, produce a summary of 120–200 words:
-- Start with the core insight (no vague openers like "this email discusses")
-- Name specifics (frameworks, stats, companies, products, findings)
-- Extract PM-relevant value: what decision/action could this inform?
-- Flag if actionable
-- Plain, confident prose. No bullet points inside the summary.
+Headline — One punchy, specific title (max 10 words). Name the actual subject: a company, stat, framework, or finding. Never start with "This", "How", or "Why".
 
-SCORE EACH EMAIL
-Also rate:
-- Relevance (1–5)
-- Urgency (High / Medium / Low)
+TL;DR — 2 complete sentences maximum. Lead with the core insight. No vague openers like "This article covers…".
 
-OUTPUT FORMAT (strict)
-- If you decide to discard: output exactly: SKIP
-- Otherwise output exactly 3 lines:
-Relevance: <1-5>
+Main Points — 3 to 5 bullets. Each bullet must be one complete sentence with a concrete finding, stat, or action. Omit a bullet entirely rather than writing a vague or incomplete one.
+
+Topic — Up to 3 topic hashtags in kebab-case (e.g. #prompt-engineering, #ai-agents, #product-strategy). Use None if no clear topic applies.
+
+Company — Up to 3 company hashtags in kebab-case (e.g. #openai, #anthropic, #google). Use None if no specific company is a key subject of the article.
+
+Urgency — Exactly one of: High, Medium, Low.
+
+OUTPUT RULES — READ CAREFULLY
+- Output ONLY the six fields in the exact format below
+- Do not write any reasoning, thinking steps, notes to yourself, or commentary outside the fields
+- Do not truncate any field mid-sentence — omit the bullet rather than leaving it incomplete
+- Each Main Points bullet must be a complete sentence
+
+OUTPUT FORMAT:
+Headline: <max 10 words>
+TL;DR: <2 sentences max>
+Main Points:
+- <complete sentence>
+- <complete sentence>
+- <complete sentence>
+Topic: <#hashtag #hashtag or None>
+Company: <#hashtag #hashtag or None>
 Urgency: <High|Medium|Low>
-Summary: <single-paragraph 120-200 word summary>
 
 Reader persona: {cfg["persona"]}
-"""
-    return f"""{system_instructions}
 
-Email details:
+---
 Subject: {item.subject}
-Sender: {item.from_addr}
-Date received: {item.date}
-Snippet / body preview:
-{item.snippet}
+From: {item.from_addr}
+Date: {item.date}
+Body:
+{item.body}
 """
 
 
@@ -428,12 +580,7 @@ def _summarise(
     client: genai.Client,
     item: EmailItem,
 ) -> ScoredSummary | None:
-    """
-    Call Gemini to score and summarise *item*.
-
-    Returns ``None`` if Gemini SKIPped the email.
-    Raises on API error after retries are exhausted (caller handles per-email).
-    """
+    """Call Gemini to summarise *item*. Returns None if Gemini SKIPped the email."""
     prompt = _build_summarise_prompt(cfg, item)
 
     def _call() -> Any:
@@ -454,208 +601,140 @@ def _summarise(
     return _parse_gemini_response(text)
 
 
-def _generate_tldr(
-    cfg: dict[str, Any],
-    client: genai.Client,
-    scored: list[tuple[str, EmailItem, ScoredSummary]],
-) -> list[str]:
-    if not scored:
-        return []
-    items = scored[:20]
-    joined = "\n\n".join(
-        f"Label: {label}\nSubject: {it.subject}\nFrom: {it.from_addr}\n"
-        f"Summary: {sc.summary}\nRelevance: {sc.relevance}/5 Urgency: {sc.urgency}"
-        for label, it, sc in items
-    )
-    prompt = (
-        'You are a PM chief-of-staff. Produce exactly 3 punchy takeaways (one sentence each) '
-        'from this daily email digest.\n'
-        'No preamble, no numbering. Output exactly 3 lines, each starting with "- ".\n\n'
-        f'Digest items:\n{joined}\n'
-    )
-
-    def _call() -> Any:
-        return client.models.generate_content(
-            model=cfg["gemini_model"],
-            contents=prompt,
-            config={"max_output_tokens": GEMINI_TLDR_MAX_OUTPUT_TOKENS},
-        )
-
-    resp = _with_retry(
-        _call,
-        max_attempts=GEMINI_RETRY_ATTEMPTS,
-        backoff_base=GEMINI_RETRY_BACKOFF,
-        retryable=_RETRYABLE_GEMINI,
-        label="gemini/tldr",
-    )
-    text = (getattr(resp, "text", "") or "").strip()
-    lines = [re.sub(r"^\s*[-•]\s*", "", ln).strip() for ln in text.splitlines() if ln.strip()]
-    return [ln for ln in lines if ln][:SLACK_TLDR_MAX_BULLETS]
-
-
-# ── Slack ──────────────────────────────────────────────────────────────────────
+# ── Markdown ───────────────────────────────────────────────────────────────────
 
 def _gmail_open_url(thread_id: str) -> str:
     return f"https://mail.google.com/mail/u/0/#all/{thread_id}"
 
 
-def _digest_header_blocks(*, title_suffix: str | None = None) -> list[dict[str, Any]]:
-    title = "Gmail digest" if not title_suffix else f"Gmail digest ({title_suffix})"
-    return [
-        {"type": "header", "text": {"type": "plain_text", "text": title, "emoji": True}},
-        {"type": "divider"},
-    ]
+_URGENCY_ICON = {"High": "🔴", "Medium": "🟡", "Low": "⚪"}
 
 
-def _label_header_block(label_name: str, *, continued: bool) -> dict[str, Any]:
-    suffix = " (cont.)" if continued else ""
-    return {
-        "type": "header",
-        "text": {"type": "plain_text", "text": f"Label: {label_name}{suffix}", "emoji": False},
-    }
-
-
-def _email_card_blocks(item: EmailItem, scored: ScoredSummary, source_label: str) -> list[dict[str, Any]]:
+def _email_to_markdown_section(item: EmailItem, scored: ScoredSummary, source_label: str) -> str:
+    """Render a single email as a structured Markdown section."""
+    icon = _URGENCY_ICON.get(scored.urgency, "⚪")
     url = _gmail_open_url(item.thread_id)
-    urgency_dot = {"High": "🔴", "Medium": "🟡", "Low": "⚪"}.get(scored.urgency, "⚪")
-    return [
-        {"type": "divider"},
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*{_slack_escape(item.subject)}*"},
-            "fields": [
-                {"type": "mrkdwn", "text": f"*From*\n{_slack_escape(item.from_addr)}"},
-                {"type": "mrkdwn", "text": f"*Date*\n{_slack_escape(item.date)}"},
-                {"type": "mrkdwn", "text": f"*Sublabel*\n{_slack_escape(source_label)}"},
-                {
-                    "type": "mrkdwn",
-                    "text": f"*Score*\nRelevance {scored.relevance}/5 · {urgency_dot} {scored.urgency}",
-                },
-            ],
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": _slack_escape(_truncate(scored.summary, SLACK_SUMMARY_MAX_CHARS)),
-            },
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Open in Gmail"},
-                    "url": url,
-                }
-            ],
-        },
+    display_name = _extract_display_name(item.from_addr)
+    display_date = _normalize_date(item.date)
+
+    lines = [
+        f"### {scored.headline}",
+        f"> **From:** {display_name} · **Date:** {display_date} · **Label:** {source_label} · {icon} {scored.urgency}",
+        "",
     ]
 
+    # Hashtag line — only emit when at least one tag exists
+    tag_parts: list[str] = []
+    if scored.topics:
+        tag_parts.append("topic: " + " ".join(scored.topics))
+    if scored.companies:
+        tag_parts.append("company: " + " ".join(scored.companies))
+    if tag_parts:
+        lines.append(" · ".join(tag_parts))
+        lines.append("")
 
-def _build_slack_messages(
+    lines += [
+        "**TL;DR**",
+        scored.tldr,
+        "",
+    ]
+
+    if scored.main_points:
+        lines.append("**Main Points**")
+        for point in scored.main_points:
+            lines.append(f"- {point}")
+        lines.append("")
+
+    lines += [
+        f"[Open in Gmail →]({url})",
+        "",
+        "---",
+        "",
+    ]
+
+    return "\n".join(lines)
+
+
+def _build_daily_brief_markdown(
     label_sections: list[tuple[str, list[tuple[EmailItem, ScoredSummary, str]]]],
     *,
-    tldr_lines: list[str] | None = None,
-    max_blocks_per_message: int = SLACK_MAX_BLOCKS_PER_MSG,
-) -> list[list[dict[str, Any]]]:
-    """Split the digest into Slack messages that each fit within the 50-block limit."""
-    messages: list[list[dict[str, Any]]] = []
-    blocks: list[dict[str, Any]] = _digest_header_blocks()
+    date_str: str,
+) -> str:
+    """Build the full Obsidian-compatible Markdown document for the daily brief."""
+    parts: list[str] = []
 
-    def flush() -> None:
-        nonlocal blocks
-        if blocks:
-            messages.append(blocks)
-        blocks = _digest_header_blocks(title_suffix=f"{len(messages) + 1}")
+    # YAML frontmatter
+    parts.append(f"---\ndate: {date_str}\ntags: [daily-brief, email-digest]\n---\n")
 
+    # Title
+    parts.append(f"# Daily Brief — {date_str}\n")
+
+    # Index: one line per article across all labels
+    all_rows = [
+        (item, scored)
+        for _, rows in label_sections
+        for item, scored, _ in rows
+    ]
+    if all_rows:
+        parts.append("## Articles Processed\n")
+        for i, (item, scored) in enumerate(all_rows, start=1):
+            display_name = _extract_display_name(item.from_addr)
+            display_date = _normalize_date(item.date)
+            parts.append(f"{i}. **{scored.headline}** — {display_name} · {display_date}")
+        parts.append("\n---\n")
+
+    # Per-label detailed sections
     for label_name, rows in label_sections:
-        label_started = False
-        continued = False
-
+        parts.append(f"## {label_name}\n")
         if not rows:
-            if len(blocks) + 2 > max_blocks_per_message:
-                flush()
-            blocks.append(_label_header_block(label_name, continued=False))
-            blocks.append(
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": "_No qualifying emails for this period._"},
-                }
-            )
+            parts.append("_No qualifying emails for this period._\n")
+            parts.append("---\n")
             continue
-
         for item, scored, source_label in rows:
-            card = _email_card_blocks(item, scored, source_label)
-            needed = (0 if label_started else 1) + len(card)
-            if len(blocks) + needed > max_blocks_per_message:
-                flush()
-                continued = True
-                label_started = False
+            parts.append(_email_to_markdown_section(item, scored, source_label))
 
-            if not label_started:
-                blocks.append(_label_header_block(label_name, continued=continued))
-                label_started = True
-            blocks.extend(card)
-
-    if tldr_lines:
-        tldr_blocks: list[dict[str, Any]] = [
-            {"type": "divider"},
-            {"type": "header", "text": {"type": "plain_text", "text": "TL;DR", "emoji": False}},
-        ]
-        bullets = "\n".join(
-            f"- {_slack_escape(x)}" for x in tldr_lines[:SLACK_TLDR_MAX_BULLETS] if x.strip()
-        )
-        if bullets:
-            tldr_blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": bullets}})
-        if len(blocks) + len(tldr_blocks) > max_blocks_per_message:
-            flush()
-        blocks.extend(tldr_blocks)
-
-    if blocks:
-        messages.append(blocks)
-    return messages
+    return "\n".join(parts)
 
 
-def _post_slack(webhook: str, blocks: list[dict[str, Any]]) -> bool:
+# ── Dropbox ────────────────────────────────────────────────────────────────────
+
+def _upload_to_dropbox(cfg: dict[str, Any], content: str, filename: str) -> bool:
     """
-    Post *blocks* to Slack.
+    Upload *content* as *filename* into the configured Dropbox folder.
 
-    Retries on 5xx errors and network failures with exponential backoff.
-    Returns ``False`` (without retrying) on 4xx errors — those indicate a
-    misconfigured webhook and won't improve on retry.
+    Always overwrites an existing file with the same name so re-runs on the
+    same day produce a fresh brief rather than an error.
+    Returns ``False`` on auth or API errors.
     """
-
-    def _do_post() -> requests.Response:
-        r = requests.post(
-            webhook,
-            json={"blocks": blocks},
-            headers={"Content-Type": "application/json"},
-            timeout=60,
-        )
-        if r.status_code >= 500:
-            # Raise so _with_retry treats this as a retryable failure.
-            raise requests.exceptions.RequestException(
-                f"Slack server error {r.status_code}: {r.text}"
-            )
-        return r
+    folder = cfg["dropbox_folder_path"]
+    path = f"{folder}/{filename}"
+    data = content.encode("utf-8")
 
     try:
-        r = _with_retry(
-            _do_post,
-            max_attempts=SLACK_RETRY_ATTEMPTS,
-            backoff_base=SLACK_RETRY_BACKOFF,
-            retryable=(requests.exceptions.RequestException,),
-            label="slack/post",
-        )
-    except requests.exceptions.RequestException as e:
-        print(f"Slack request failed after {SLACK_RETRY_ATTEMPTS} attempts: {e}", file=sys.stderr)
-        return False
+        dbx = dropbox_sdk.Dropbox(oauth2_access_token=cfg["dropbox_access_token"])
 
-    if r.status_code >= 400:
-        print(f"Slack webhook error {r.status_code}: {r.text}", file=sys.stderr)
+        def _do_upload() -> None:
+            dbx.files_upload(data, path, mode=WriteMode("overwrite"))
+
+        _with_retry(
+            _do_upload,
+            max_attempts=DROPBOX_RETRY_ATTEMPTS,
+            backoff_base=DROPBOX_RETRY_BACKOFF,
+            retryable=(requests.exceptions.RequestException, ConnectionError, TimeoutError),
+            label=f"dropbox/upload {filename}",
+        )
+        _debug(f"[dropbox] uploaded {path}")
+        return True
+    except AuthError as e:
+        print(
+            f"Dropbox authentication failed. Check DROPBOX_ACCESS_TOKEN.\n"
+            f"Underlying error: {e}",
+            file=sys.stderr,
+        )
         return False
-    return True
+    except ApiError as e:
+        print(f"Dropbox API error uploading {path}: {e}", file=sys.stderr)
+        return False
 
 
 # ── Orchestration ──────────────────────────────────────────────────────────────
@@ -666,7 +745,8 @@ def main() -> int:
         "[config] "
         + f"labels={cfg['labels']!r} date_window_days={cfg['date_window_days']} "
         + f"max_emails_per_label={cfg['max_emails_per_label']} "
-        + f"filter_keywords={len(cfg['filter_keywords'])}",
+        + f"filter_keywords={len(cfg['filter_keywords'])} "
+        + f"dropbox_folder={cfg['dropbox_folder_path']!r}",
         file=sys.stderr,
     )
 
@@ -686,7 +766,6 @@ def main() -> int:
         return 1
 
     label_sections: list[tuple[str, list[tuple[EmailItem, ScoredSummary, str]]]] = []
-    all_scored: list[tuple[str, EmailItem, ScoredSummary]] = []
 
     for parent_label in cfg["labels"]:
         family = _expand_label_family(all_labels, parent_label)
@@ -730,18 +809,14 @@ def main() -> int:
                 print(f"Gmail API error during label-check for {parent_label!r}: {e}", file=sys.stderr)
                 return 1
 
-        # Deduplicate before issuing any email-detail API calls so we don't
-        # fetch the same message twice when it appears in both a parent label
-        # and a child label.
         seen_msg_ids: set[str] = set()
-        deduped: list[tuple[str, str]] = []  # (msg_id, source_label_name)
+        deduped: list[tuple[str, str]] = []
         for ref, source_label_name in refs_with_source:
             mid = ref.get("id")
             if mid and mid not in seen_msg_ids:
                 seen_msg_ids.add(mid)
                 deduped.append((mid, source_label_name))
 
-        # Fetch email metadata (fast, serial — each call is a tiny metadata GET).
         keyword_filtered = 0
         items_to_summarise: list[tuple[EmailItem, str]] = []
         for mid, source_label_name in deduped:
@@ -756,8 +831,6 @@ def main() -> int:
                 continue
             items_to_summarise.append((item, source_label_name))
 
-        # Parallel Gemini summarisation — each email is an independent API call
-        # so we saturate the quota allowance instead of waiting serially.
         gemini_skipped = 0
         gemini_errors = 0
         rows: list[tuple[EmailItem, ScoredSummary, str]] = []
@@ -779,7 +852,6 @@ def main() -> int:
                     _debug(f"[gemini] SKIP: {item.subject!r}")
                     continue
                 rows.append((item, scored, source_label_name))
-                all_scored.append((parent_label, item, scored))
 
         kept = len(rows)
         print(
@@ -791,21 +863,19 @@ def main() -> int:
         )
         label_sections.append((parent_label, rows))
 
-    # Only attempt TL;DR when there are scored emails — avoids a wasted API
-    # call on days with no qualifying content.
-    tldr: list[str] = []
-    if all_scored:
-        try:
-            tldr = _generate_tldr(cfg, gemini_client, all_scored)
-        except Exception as e:
-            _debug(f"[tldr] failed: {e}")
+    date_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+    filename = f"{date_str}-daily-brief.md"
+    markdown = _build_daily_brief_markdown(label_sections, date_str=date_str)
 
-    messages = _build_slack_messages(label_sections, tldr_lines=tldr)
-    for i, blocks in enumerate(messages, start=1):
-        _debug(f"[slack] posting message {i}/{len(messages)} blocks={len(blocks)}")
-        if not _post_slack(cfg["slack_webhook"], blocks):
-            return 1
+    _debug(f"[markdown] built brief: {len(markdown)} chars")
 
+    if not _upload_to_dropbox(cfg, markdown, filename):
+        return 1
+
+    print(
+        f"[done] uploaded {filename} to {cfg['dropbox_folder_path']}/{filename}",
+        file=sys.stderr,
+    )
     return 0
 
 

@@ -7,43 +7,18 @@ from digest import (
     EmailItem,
     GmailLabel,
     ScoredSummary,
-    _build_slack_messages,
-    _email_card_blocks,
+    _build_daily_brief_markdown,
+    _email_to_markdown_section,
     _expand_label_family,
+    _extract_display_name,
     _gmail_open_url,
     _matches_filter,
+    _normalize_date,
     _parse_csv_env,
     _parse_gemini_response,
-    _slack_escape,
+    _parse_hashtags,
     _truncate,
 )
-
-
-# ── _slack_escape ──────────────────────────────────────────────────────────────
-
-def test_slack_escape_ampersand():
-    assert _slack_escape("a & b") == "a &amp; b"
-
-
-def test_slack_escape_lt_gt():
-    assert _slack_escape("<tag>") == "&lt;tag&gt;"
-
-
-def test_slack_escape_combined():
-    assert _slack_escape("a < b & c > d") == "a &lt; b &amp; c &gt; d"
-
-
-def test_slack_escape_no_special_chars():
-    assert _slack_escape("hello world") == "hello world"
-
-
-def test_slack_escape_empty_string():
-    assert _slack_escape("") == ""
-
-
-def test_slack_escape_idempotent_entities():
-    # Already-escaped entities should be double-escaped (we escape, not unescape).
-    assert _slack_escape("&amp;") == "&amp;amp;"
 
 
 # ── _truncate ──────────────────────────────────────────────────────────────────
@@ -99,7 +74,7 @@ def test_parse_csv_env_trims_whitespace():
 # ── _matches_filter ────────────────────────────────────────────────────────────
 
 def test_matches_filter_no_keywords_always_false():
-    assert _matches_filter("subject", "snippet", []) is False
+    assert _matches_filter("subject", "body", []) is False
 
 
 def test_matches_filter_match_in_subject():
@@ -119,7 +94,6 @@ def test_matches_filter_no_match():
 
 
 def test_matches_filter_partial_word_matches():
-    # "sale" appears inside "wholesale" — should still match.
     assert _matches_filter("Wholesale pricing", "n/a", ["sale"]) is True
 
 
@@ -152,7 +126,6 @@ def test_expand_label_family_empty_name_returns_empty():
 
 
 def test_expand_label_family_no_partial_word_match():
-    """'Work' must not match 'Workshop'."""
     labs = _labels("Work", "Workshop", "Workshop/Advanced")
     result = _expand_label_family(labs, "Work")
     assert [l.name for l in result] == ["Work"]
@@ -170,13 +143,109 @@ def test_gmail_open_url_format():
     assert _gmail_open_url("abc123") == "https://mail.google.com/mail/u/0/#all/abc123"
 
 
-def test_gmail_open_url_special_chars_in_thread_id():
-    # Thread IDs are hex strings; just verify it's embedded verbatim.
-    tid = "1234abcd"
-    assert tid in _gmail_open_url(tid)
+def test_gmail_open_url_contains_thread_id():
+    assert "1234abcd" in _gmail_open_url("1234abcd")
+
+
+# ── _extract_display_name ──────────────────────────────────────────────────────
+
+def test_extract_display_name_standard_format():
+    assert _extract_display_name("ByteByteGo <bytebytego@substack.com>") == "ByteByteGo"
+
+
+def test_extract_display_name_quoted_name():
+    assert _extract_display_name('"Paweł from Product Compass" <p@sub.com>') == "Paweł from Product Compass"
+
+
+def test_extract_display_name_name_with_spaces():
+    result = _extract_display_name("Guillermo Flor from Product Market Fit <g@sub.com>")
+    assert result == "Guillermo Flor from Product Market Fit"
+
+
+def test_extract_display_name_no_angle_brackets():
+    assert _extract_display_name("just@email.com") == "just@email.com"
+
+
+def test_extract_display_name_strips_whitespace():
+    assert _extract_display_name("  TLDR  <dan@tldrnewsletter.com>") == "TLDR"
+
+
+# ── _normalize_date ────────────────────────────────────────────────────────────
+
+def test_normalize_date_rfc2822():
+    assert _normalize_date("Sat, 11 Apr 2026 15:30:49 +0000") == "11 Apr 2026"
+
+
+def test_normalize_date_with_offset():
+    assert _normalize_date("Mon, 06 Apr 2026 12:40:49 +0530") == "6 Apr 2026"
+
+
+def test_normalize_date_no_leading_zero_on_day():
+    result = _normalize_date("Wed, 08 Apr 2026 10:19:10 +0000")
+    assert result == "8 Apr 2026"
+    assert not result.startswith("0")
+
+
+def test_normalize_date_unparseable_returns_raw():
+    raw = "not a real date"
+    assert _normalize_date(raw) == raw
+
+
+# ── _parse_hashtags ────────────────────────────────────────────────────────────
+
+def test_parse_hashtags_with_hash_prefix():
+    assert _parse_hashtags("#openai #anthropic") == ["#openai", "#anthropic"]
+
+
+def test_parse_hashtags_without_hash_prefix():
+    assert _parse_hashtags("openai anthropic") == ["#openai", "#anthropic"]
+
+
+def test_parse_hashtags_mixed_case_normalized():
+    assert _parse_hashtags("#OpenAI") == ["#openai"]
+
+
+def test_parse_hashtags_kebab_case_preserved():
+    assert _parse_hashtags("#prompt-engineering") == ["#prompt-engineering"]
+
+
+def test_parse_hashtags_comma_separated():
+    result = _parse_hashtags("#ai-agents, #product-strategy")
+    assert "#ai-agents" in result
+    assert "#product-strategy" in result
+
+
+def test_parse_hashtags_none_returns_empty():
+    assert _parse_hashtags("None") == []
+
+
+def test_parse_hashtags_na_returns_empty():
+    assert _parse_hashtags("N/A") == []
+
+
+def test_parse_hashtags_empty_string_returns_empty():
+    assert _parse_hashtags("") == []
+
+
+def test_parse_hashtags_single_tag():
+    assert _parse_hashtags("#google") == ["#google"]
 
 
 # ── _parse_gemini_response ─────────────────────────────────────────────────────
+
+_VALID_RESPONSE = (
+    "Headline: Anthropic Surpasses OpenAI in Enterprise Revenue\n"
+    "TL;DR: Anthropic has reached a $30B run-rate, overtaking OpenAI's $24B. "
+    "Enterprise adoption of Claude is accelerating faster than GPT-4 equivalents.\n"
+    "Main Points:\n"
+    "- Anthropic's revenue run-rate hit $30B, ahead of OpenAI's $24B.\n"
+    "- Safety-focused positioning is winning enterprise procurement teams.\n"
+    "- OpenAI faces internal friction with CFO excluded from strategic decisions.\n"
+    "Topic: #ai-industry #revenue\n"
+    "Company: #anthropic #openai\n"
+    "Urgency: High\n"
+)
+
 
 def test_parse_gemini_response_skip_uppercase():
     assert _parse_gemini_response("SKIP") is None
@@ -190,191 +259,301 @@ def test_parse_gemini_response_skip_with_trailing_newline():
     assert _parse_gemini_response("SKIP\n") is None
 
 
-def test_parse_gemini_response_valid_structured():
-    text = "Relevance: 4\nUrgency: High\nSummary: This is a great insight."
-    result = _parse_gemini_response(text)
+def test_parse_gemini_response_valid_headline():
+    result = _parse_gemini_response(_VALID_RESPONSE)
     assert result is not None
-    assert result.relevance == 4
+    assert result.headline == "Anthropic Surpasses OpenAI in Enterprise Revenue"
+
+
+def test_parse_gemini_response_valid_tldr():
+    result = _parse_gemini_response(_VALID_RESPONSE)
+    assert result is not None
+    assert "$30B" in result.tldr
+
+
+def test_parse_gemini_response_valid_main_points():
+    result = _parse_gemini_response(_VALID_RESPONSE)
+    assert result is not None
+    assert len(result.main_points) == 3
+    assert any("$30B" in p for p in result.main_points)
+
+
+def test_parse_gemini_response_valid_topics():
+    result = _parse_gemini_response(_VALID_RESPONSE)
+    assert result is not None
+    assert "#ai-industry" in result.topics
+    assert "#revenue" in result.topics
+
+
+def test_parse_gemini_response_valid_companies():
+    result = _parse_gemini_response(_VALID_RESPONSE)
+    assert result is not None
+    assert "#anthropic" in result.companies
+    assert "#openai" in result.companies
+
+
+def test_parse_gemini_response_valid_urgency():
+    result = _parse_gemini_response(_VALID_RESPONSE)
+    assert result is not None
     assert result.urgency == "High"
-    assert "great insight" in result.summary
 
 
-def test_parse_gemini_response_no_space_after_colon():
-    """Regression: Gemini sometimes omits the space after the colon."""
-    text = "Relevance:3\nUrgency:Medium\nSummary:Short summary here."
+def test_parse_gemini_response_no_relevance_field():
+    """Relevance has been removed — responses without it should parse fine."""
+    result = _parse_gemini_response(_VALID_RESPONSE)
+    assert result is not None
+    assert not hasattr(result, "relevance")
+
+
+def test_parse_gemini_response_topic_none_returns_empty_list():
+    text = (
+        "Headline: A headline\n"
+        "TL;DR: A summary.\n"
+        "Main Points:\n- Point one.\n"
+        "Topic: None\n"
+        "Company: #openai\n"
+        "Urgency: Low\n"
+    )
     result = _parse_gemini_response(text)
     assert result is not None
-    assert result.relevance == 3
-    assert result.urgency == "Medium"
+    assert result.topics == []
+
+
+def test_parse_gemini_response_company_none_returns_empty_list():
+    text = (
+        "Headline: A headline\n"
+        "TL;DR: A summary.\n"
+        "Main Points:\n- Point one.\n"
+        "Topic: #ai-agents\n"
+        "Company: None\n"
+        "Urgency: Medium\n"
+    )
+    result = _parse_gemini_response(text)
+    assert result is not None
+    assert result.companies == []
 
 
 def test_parse_gemini_response_case_insensitive_urgency():
-    text = "Relevance: 2\nUrgency: high\nSummary: A summary."
+    text = (
+        "Headline: H\nTL;DR: S.\nMain Points:\n- P.\n"
+        "Topic: None\nCompany: None\nUrgency: high\n"
+    )
     result = _parse_gemini_response(text)
     assert result is not None
-    assert result.urgency == "High"  # normalised to title-case
-
-
-def test_parse_gemini_response_multiline_summary():
-    text = "Relevance: 5\nUrgency: Low\nSummary: Line one.\nLine two continues the thought."
-    result = _parse_gemini_response(text)
-    assert result is not None
-    assert "Line one" in result.summary
-    assert "Line two" in result.summary
-
-
-def test_parse_gemini_response_all_relevance_values():
-    for score in range(1, 6):
-        text = f"Relevance: {score}\nUrgency: Low\nSummary: Test."
-        result = _parse_gemini_response(text)
-        assert result is not None
-        assert result.relevance == score
+    assert result.urgency == "High"
 
 
 def test_parse_gemini_response_all_urgency_values():
     for urg in ("High", "Medium", "Low"):
-        text = f"Relevance: 3\nUrgency: {urg}\nSummary: Test."
+        text = (
+            f"Headline: H\nTL;DR: S.\nMain Points:\n- P.\n"
+            f"Topic: None\nCompany: None\nUrgency: {urg}\n"
+        )
         result = _parse_gemini_response(text)
         assert result is not None
         assert result.urgency == urg
 
 
 def test_parse_gemini_response_fallback_on_malformed():
-    """Unstructured response gets fallback scores."""
     text = "This is just some random text without structure."
     result = _parse_gemini_response(text)
     assert result is not None
-    assert result.relevance == 3
     assert result.urgency == "Low"
-    assert result.summary == text
+    assert text in result.tldr
+    assert result.topics == []
+    assert result.companies == []
 
 
-def test_parse_gemini_response_fallback_preserves_full_text():
-    text = "A paragraph with no scoring fields at all."
-    result = _parse_gemini_response(text)
-    assert result is not None
-    assert result.summary == text
-
-
-# ── _email_card_blocks ─────────────────────────────────────────────────────────
+# ── helpers ────────────────────────────────────────────────────────────────────
 
 def _make_item(subject: str = "Test Subject") -> EmailItem:
     return EmailItem(
         msg_id="msg1",
         thread_id="thread1",
         subject=subject,
-        from_addr="sender@example.com",
-        date="2024-01-01",
-        snippet="snippet text",
+        from_addr="ByteByteGo <bytebytego@substack.com>",
+        date="Sat, 11 Apr 2026 15:30:49 +0000",
+        snippet="Short preview of the email.",
+        body="Full body text of the email goes here.",
     )
 
 
-def _make_scored(relevance: int = 3, urgency: str = "Low") -> ScoredSummary:
-    return ScoredSummary(summary="A good summary.", relevance=relevance, urgency=urgency)
+def _make_scored(
+    headline: str = "A great insight on product thinking",
+    tldr: str = "A concise high-level summary.",
+    main_points: list | None = None,
+    topics: list | None = None,
+    companies: list | None = None,
+    urgency: str = "Low",
+) -> ScoredSummary:
+    return ScoredSummary(
+        headline=headline,
+        tldr=tldr,
+        main_points=main_points if main_points is not None else ["Point one.", "Point two."],
+        topics=topics if topics is not None else ["#ai-agents"],
+        companies=companies if companies is not None else ["#openai"],
+        urgency=urgency,
+    )
 
 
-def test_email_card_blocks_returns_four_blocks():
-    card = _email_card_blocks(_make_item(), _make_scored(), "MyLabel")
-    assert len(card) == 4
+# ── _email_to_markdown_section ─────────────────────────────────────────────────
+
+def test_email_to_markdown_section_headline_as_h3():
+    md = _email_to_markdown_section(_make_item(), _make_scored(headline="My Headline"), "L")
+    assert "### My Headline" in md
 
 
-def test_email_card_blocks_contains_gmail_url():
-    card = _email_card_blocks(_make_item(), _make_scored(), "MyLabel")
-    actions = next(b for b in card if b["type"] == "actions")
-    url = actions["elements"][0]["url"]
-    assert "mail.google.com" in url
-    assert "thread1" in url
+def test_email_to_markdown_section_shows_display_name_not_raw_address():
+    md = _email_to_markdown_section(_make_item(), _make_scored(), "L")
+    assert "ByteByteGo" in md
+    assert "bytebytego@substack.com" not in md
 
 
-def test_email_card_blocks_subject_escaped():
-    item = _make_item(subject="<Alert> & Warning")
-    card = _email_card_blocks(item, _make_scored(), "L")
-    header_block = next(b for b in card if b["type"] == "section" and "fields" in b)
-    assert "&lt;Alert&gt;" in header_block["text"]["text"]
+def test_email_to_markdown_section_shows_normalized_date():
+    md = _email_to_markdown_section(_make_item(), _make_scored(), "L")
+    assert "11 Apr 2026" in md
+    assert "+0000" not in md
 
 
-def test_email_card_blocks_high_urgency_uses_red_dot():
-    card = _email_card_blocks(_make_item(), _make_scored(urgency="High"), "L")
-    fields_block = next(b for b in card if b["type"] == "section" and "fields" in b)
-    score_field = fields_block["fields"][3]["text"]
-    assert "🔴" in score_field
+def test_email_to_markdown_section_shows_label():
+    md = _email_to_markdown_section(_make_item(), _make_scored(), "Education/Newsletter")
+    assert "Education/Newsletter" in md
 
 
-# ── _build_slack_messages ──────────────────────────────────────────────────────
+def test_email_to_markdown_section_topic_hashtags():
+    scored = _make_scored(topics=["#prompt-engineering", "#ai-agents"])
+    md = _email_to_markdown_section(_make_item(), scored, "L")
+    assert "topic: #prompt-engineering #ai-agents" in md
 
-def test_build_slack_messages_empty_section_shows_placeholder():
-    msgs = _build_slack_messages([("MyLabel", [])])
-    assert len(msgs) == 1
-    texts = [
-        b.get("text", {}).get("text", "")
-        for b in msgs[0]
-        if isinstance(b.get("text"), dict)
+
+def test_email_to_markdown_section_company_hashtags():
+    scored = _make_scored(companies=["#openai", "#anthropic"])
+    md = _email_to_markdown_section(_make_item(), scored, "L")
+    assert "company: #openai #anthropic" in md
+
+
+def test_email_to_markdown_section_no_hashtag_line_when_empty():
+    scored = _make_scored(topics=[], companies=[])
+    md = _email_to_markdown_section(_make_item(), scored, "L")
+    assert "topic:" not in md
+    assert "company:" not in md
+
+
+def test_email_to_markdown_section_tldr_section():
+    scored = _make_scored(tldr="Core insight sentence here.")
+    md = _email_to_markdown_section(_make_item(), scored, "L")
+    assert "**TL;DR**" in md
+    assert "Core insight sentence here." in md
+
+
+def test_email_to_markdown_section_main_points():
+    scored = _make_scored(main_points=["Alpha is first.", "Beta is second."])
+    md = _email_to_markdown_section(_make_item(), scored, "L")
+    assert "**Main Points**" in md
+    assert "- Alpha is first." in md
+    assert "- Beta is second." in md
+
+
+def test_email_to_markdown_section_no_main_points_header_when_empty():
+    scored = _make_scored(main_points=[])
+    md = _email_to_markdown_section(_make_item(), scored, "L")
+    assert "**Main Points**" not in md
+
+
+def test_email_to_markdown_section_gmail_link_last():
+    md = _email_to_markdown_section(_make_item(), _make_scored(), "L")
+    assert "[Open in Gmail →]" in md
+    assert "thread1" in md
+    assert md.index("Open in Gmail") > md.index("TL;DR")
+
+
+def test_email_to_markdown_section_high_urgency_red_dot():
+    md = _email_to_markdown_section(_make_item(), _make_scored(urgency="High"), "L")
+    assert "🔴" in md
+
+
+def test_email_to_markdown_section_no_relevance_score():
+    """Score field (e.g. '4/5') must no longer appear in sections."""
+    md = _email_to_markdown_section(_make_item(), _make_scored(), "L")
+    assert "/5" not in md
+
+
+# ── _build_daily_brief_markdown ────────────────────────────────────────────────
+
+def test_build_daily_brief_markdown_has_frontmatter():
+    md = _build_daily_brief_markdown([], date_str="2024-01-01")
+    assert md.startswith("---\n")
+    assert "date: 2024-01-01" in md
+
+
+def test_build_daily_brief_markdown_has_title():
+    md = _build_daily_brief_markdown([], date_str="2024-01-15")
+    assert "# Daily Brief — 2024-01-15" in md
+
+
+def test_build_daily_brief_markdown_index_section():
+    rows = [(_make_item(), _make_scored(headline="AI Strategy Insight"), "L")]
+    md = _build_daily_brief_markdown([("Education", rows)], date_str="2024-01-01")
+    assert "## Articles Processed" in md
+    assert "AI Strategy Insight" in md
+
+
+def test_build_daily_brief_markdown_index_uses_display_name():
+    rows = [(_make_item(), _make_scored(), "L")]
+    md = _build_daily_brief_markdown([("Education", rows)], date_str="2024-01-01")
+    index_section = md.split("## Articles Processed")[1].split("## Education")[0]
+    assert "ByteByteGo" in index_section
+    assert "bytebytego@substack.com" not in index_section
+
+
+def test_build_daily_brief_markdown_index_uses_normalized_date():
+    rows = [(_make_item(), _make_scored(), "L")]
+    md = _build_daily_brief_markdown([("Education", rows)], date_str="2024-01-01")
+    index_section = md.split("## Articles Processed")[1].split("## Education")[0]
+    assert "11 Apr 2026" in index_section
+    assert "+0000" not in index_section
+
+
+def test_build_daily_brief_markdown_index_numbered():
+    rows = [
+        (_make_item(), _make_scored(headline="First"), "L"),
+        (_make_item(), _make_scored(headline="Second"), "L"),
     ]
-    assert any("No qualifying" in t for t in texts)
+    md = _build_daily_brief_markdown([("L", rows)], date_str="2024-01-01")
+    assert "1. **First**" in md
+    assert "2. **Second**" in md
 
 
-def test_build_slack_messages_single_email():
-    sections = [("L", [(_make_item(), _make_scored(), "L/Sub")])]
-    msgs = _build_slack_messages(sections)
-    assert len(msgs) == 1
-    block_types = [b["type"] for b in msgs[0]]
-    assert "header" in block_types
-    assert "actions" in block_types
+def test_build_daily_brief_markdown_no_index_when_no_emails():
+    md = _build_daily_brief_markdown([("Education", [])], date_str="2024-01-01")
+    assert "## Articles Processed" not in md
 
 
-def test_build_slack_messages_all_blocks_within_limit():
-    rows = [(_make_item(), _make_scored(), "Label") for _ in range(5)]
-    msgs = _build_slack_messages([("Label", rows)])
-    for msg in msgs:
-        assert len(msg) <= 49
+def test_build_daily_brief_markdown_empty_label_placeholder():
+    md = _build_daily_brief_markdown([("Education", [])], date_str="2024-01-01")
+    assert "No qualifying emails" in md
 
 
-def test_build_slack_messages_splits_on_block_limit():
-    """A tight max forces the digest into multiple messages."""
-    # Each email card = 4 blocks + label header = 1 → 5 per email.
-    # Header + divider = 2. So 2 emails = 2 + 1 + 4 + 4 = 11 blocks.
-    # Setting limit to 7 forces a split after the first email.
-    rows = [(_make_item(), _make_scored(), "L"), (_make_item(), _make_scored(), "L")]
-    msgs = _build_slack_messages([("L", rows)], max_blocks_per_message=7)
-    assert len(msgs) >= 2
-
-
-def test_build_slack_messages_with_tldr_appears_in_last_message():
-    sections = [("L", [])]
-    msgs = _build_slack_messages(sections, tldr_lines=["Point one", "Point two", "Point three"])
-    last_blocks = msgs[-1]
-    texts = [
-        b.get("text", {}).get("text", "")
-        for b in last_blocks
-        if isinstance(b.get("text"), dict)
-    ]
-    assert any("TL;DR" in t for t in texts)
-
-
-def test_build_slack_messages_tldr_capped_at_three_bullets():
-    sections = [("L", [])]
-    lines = ["A", "B", "C", "D", "E"]
-    msgs = _build_slack_messages(sections, tldr_lines=lines)
-    # Find the TL;DR section block and count bullet lines.
-    all_blocks = [b for msg in msgs for b in msg]
-    tldr_section = next(
-        (b for b in all_blocks if b["type"] == "section" and "- " in b.get("text", {}).get("text", "")),
-        None,
+def test_build_daily_brief_markdown_multiple_labels():
+    rows1 = [(_make_item(), _make_scored(headline="Headline A"), "L1")]
+    rows2 = [(_make_item(), _make_scored(headline="Headline B"), "L2")]
+    md = _build_daily_brief_markdown(
+        [("Label1", rows1), ("Label2", rows2)], date_str="2024-01-01"
     )
-    assert tldr_section is not None
-    bullet_count = tldr_section["text"]["text"].count("\n- ") + 1  # n items = n-1 newlines + 1
-    assert bullet_count <= 3
+    assert "## Label1" in md
+    assert "## Label2" in md
+    assert "Headline A" in md
+    assert "Headline B" in md
 
 
-def test_build_slack_messages_multiple_labels():
-    rows1 = [(_make_item("Subj A"), _make_scored(), "L1")]
-    rows2 = [(_make_item("Subj B"), _make_scored(), "L2")]
-    msgs = _build_slack_messages([("Label1", rows1), ("Label2", rows2)])
-    all_text = " ".join(
-        b.get("text", {}).get("text", "")
-        for msg in msgs
-        for b in msg
-        if isinstance(b.get("text"), dict)
-    )
-    assert "Label1" in all_text
-    assert "Label2" in all_text
+def test_build_daily_brief_markdown_index_before_sections():
+    rows = [(_make_item(), _make_scored(headline="Test"), "L")]
+    md = _build_daily_brief_markdown([("Education", rows)], date_str="2024-01-01")
+    assert md.index("Articles Processed") < md.index("## Education")
+
+
+def test_build_daily_brief_markdown_no_relevance_anywhere():
+    """Relevance scores must not appear anywhere in the document."""
+    rows = [(_make_item(), _make_scored(), "L")]
+    md = _build_daily_brief_markdown([("Education", rows)], date_str="2024-01-01")
+    assert "/5" not in md
