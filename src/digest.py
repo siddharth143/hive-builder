@@ -32,7 +32,8 @@ GMAIL_SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
 GMAIL_TOKEN_URI = "https://oauth2.googleapis.com/token"
 GMAIL_EXECUTE_RETRIES = 3       # built-in retry in googleapiclient .execute()
 
-GEMINI_MAX_OUTPUT_TOKENS = 2048
+GEMINI_MAX_OUTPUT_TOKENS = 3072
+GEMINI_KEY_NUMBERS_MAX_TOKENS = 768
 GEMINI_MAX_WORKERS = 5          # concurrent summarisation threads
 GEMINI_RETRY_ATTEMPTS = 3       # per-call retry on transient errors
 GEMINI_RETRY_BACKOFF = 2.0      # exponential backoff base (seconds)
@@ -42,7 +43,18 @@ DROPBOX_RETRY_BACKOFF = 2.0
 
 MAX_BODY_CHARS = 6000           # max email body chars forwarded to Gemini
 
-VALID_URGENCY: frozenset[str] = frozenset({"High", "Medium", "Low"})
+# Canonical theme buckets for index + grouping (must match the summarisation prompt).
+THEME_SECTION_ORDER: tuple[str, ...] = (
+    "AI infrastructure & compute",
+    "System design & engineering",
+    "AI product strategy & agents",
+    "Business & market signals",
+    "Productivity & workflows",
+    "Vibe coding",
+    "AI Product Management",
+    "AI Models",
+)
+_DEFAULT_THEME = "AI Product Management"
 
 DEBUG = (os.environ.get("DEBUG") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
@@ -69,12 +81,14 @@ class EmailItem:
 
 @dataclass
 class ScoredSummary:
-    headline: str       # AI one-liner title
-    tldr: str           # 1-2 sentence high-level summary
-    main_points: list   # key bullet points
+    headline: str       # sentence-case article title for the brief
+    theme: str          # one of THEME_SECTION_ORDER (normalized)
+    read_minutes: int   # 2, 3, or 4 — estimated read time for this piece
+    tldr: str           # 2–3 sentences
+    key_insight: str    # single most useful line
+    main_points: list   # bullet strings (concrete points)
     topics: list        # topic hashtags e.g. ['#prompt-engineering']
     companies: list     # company hashtags e.g. ['#openai']
-    urgency: str        # "High" | "Medium" | "Low"
 
 
 @dataclass(frozen=True)
@@ -157,6 +171,30 @@ def _parse_hashtags(raw: str) -> list[str]:
         if normalized:
             result.append(f"#{normalized}")
     return result
+
+
+def _normalize_theme(raw: str) -> str:
+    """Map model output to a canonical theme from THEME_SECTION_ORDER."""
+    s = (raw or "").strip()
+    if not s:
+        return _DEFAULT_THEME
+    sl = s.lower()
+    for canonical in THEME_SECTION_ORDER:
+        if sl == canonical.lower():
+            return canonical
+    for canonical in THEME_SECTION_ORDER:
+        if sl in canonical.lower() or canonical.lower() in sl:
+            return canonical
+    return _DEFAULT_THEME
+
+
+def _email_sort_timestamp(item: EmailItem) -> float:
+    """Parse email date for descending sort (newest first); unparseable → 0."""
+    try:
+        dt = parsedate_to_datetime(item.date.strip())
+        return dt.timestamp()
+    except Exception:
+        return 0.0
 
 
 # ── Email body extraction ──────────────────────────────────────────────────────
@@ -448,43 +486,48 @@ def _parse_gemini_response(text: str) -> ScoredSummary | None:
     Returns ``None``          → Gemini decided to SKIP this email.
     Returns ``ScoredSummary`` → parsed (or fallback) result.
 
-    Expected format:
-        Headline: <text>
-        TL;DR: <text>
-        Main Points:
-        - point 1
-        - point 2
-        Topic: #tag1 #tag2 or None
-        Company: #tag1 or None
-        Urgency: High|Medium|Low
+    Expected machine-readable block (see ``_build_summarise_prompt``).
     """
     stripped = text.strip()
 
     if re.match(r"^SKIP\s*$", stripped, re.IGNORECASE):
         return None
 
-    head_m = re.search(r"(?im)^\s*Headline\s*:\s*(.+)", stripped)
-    # TL;DR: from field value up to "Main Points:" or end
+    theme_m = re.search(r"(?im)^\s*Theme\s*:\s*(.+)$", stripped, re.MULTILINE)
+    read_m = re.search(r"(?im)^\s*Read\s+minutes\s*:\s*([234])\s*$", stripped, re.MULTILINE)
+    title_m = re.search(
+        r"(?im)^\s*(?:Article\s+title|Headline)\s*:\s*(.+)$",
+        stripped,
+        re.MULTILINE,
+    )
     tldr_m = re.search(
-        r"(?im)^\s*TL;?DR\s*:\s*(.+?)(?=^\s*Main\s+Points\s*:|\Z)",
+        r"(?im)^\s*TL;?DR\s*:\s*(.+?)(?=^\s*Key\s+insight\s*:|\Z)",
         stripped,
         re.DOTALL | re.MULTILINE,
     )
-    # Main Points: from section header up to "Topic:" or end
+    insight_m = re.search(
+        r"(?im)^\s*Key\s+insight\s*:\s*(.+?)(?=^\s*Main\s+points\s*:|\Z)",
+        stripped,
+        re.DOTALL | re.MULTILINE,
+    )
     points_m = re.search(
-        r"(?im)^\s*Main\s+Points\s*:\s*\n(.*?)(?=^\s*Topic\s*:|\Z)",
+        r"(?im)^\s*Main\s+points\s*:\s*\n(.*?)(?=^\s*Topic\s*:|\Z)",
         stripped,
         re.DOTALL | re.MULTILINE,
     )
-    topic_m = re.search(r"(?im)^\s*Topic\s*:\s*(.+)", stripped)
-    company_m = re.search(r"(?im)^\s*Company\s*:\s*(.+)", stripped)
-    urg_m = re.search(r"(?im)^\s*Urgency\s*:\s*(High|Medium|Low)\s*$", stripped, re.IGNORECASE)
+    topic_m = re.search(r"(?im)^\s*Topic\s*:\s*(.+)$", stripped, re.MULTILINE)
+    company_m = re.search(r"(?im)^\s*Company\s*:\s*(.+)$", stripped, re.MULTILINE)
 
-    if head_m and tldr_m and urg_m:
-        raw_urgency = urg_m.group(1).strip()
-        urgency = next(u for u in VALID_URGENCY if u.lower() == raw_urgency.lower())
-        headline = head_m.group(1).strip()
+    if theme_m and read_m and title_m and tldr_m and insight_m:
+        headline = title_m.group(1).strip()
         tldr = tldr_m.group(1).strip()
+        key_insight = insight_m.group(1).strip()
+        theme = _normalize_theme(theme_m.group(1).strip())
+        try:
+            read_minutes = int(read_m.group(1).strip())
+        except ValueError:
+            read_minutes = 3
+        read_minutes = max(2, min(4, read_minutes))
 
         main_points: list[str] = []
         if points_m:
@@ -499,31 +542,74 @@ def _parse_gemini_response(text: str) -> ScoredSummary | None:
 
         return ScoredSummary(
             headline=headline,
+            theme=theme,
+            read_minutes=read_minutes,
             tldr=tldr,
+            key_insight=key_insight,
             main_points=main_points,
             topics=topics,
             companies=companies,
-            urgency=urgency,
         )
 
-    # Fallback: first non-empty line as headline, full text as TL;DR
     _debug(f"[gemini] structured parse failed — using fallback:\n{stripped[:200]}")
     first_line = next((ln.strip() for ln in stripped.splitlines() if ln.strip()), stripped)
     return ScoredSummary(
         headline=first_line[:100],
+        theme=_DEFAULT_THEME,
+        read_minutes=3,
         tldr=stripped,
+        key_insight="",
         main_points=[],
         topics=[],
         companies=[],
-        urgency="Low",
     )
 
 
-def _build_summarise_prompt(cfg: dict[str, Any], item: EmailItem) -> str:
-    return f"""You are a senior product manager's daily briefing assistant. Read the email below and produce a structured summary or discard it.
+def _build_summarise_prompt(cfg: dict[str, Any], item: EmailItem, brief_date_str: str) -> str:
+    theme_list = "\n".join(f"- {t}" for t in THEME_SECTION_ORDER)
+    return f"""#role:
+You are a senior product manager's daily briefing assistant. Your job is to convert newsletter emails into structured fields for a daily Obsidian brief. Follow every formatting rule below exactly — no deviations, no extra or placeholder fields.
 
-PERSONA
+The full brief for **{brief_date_str}** is assembled by software from many emails. **You only see one email.** Your output must be the plain **OUTPUT FIELD BLOCK** at the bottom — not the full Markdown document.
+
+#PERSONA
 Think like a senior PM. Prioritise: strategic insights, market trends, competitive intelligence, frameworks with real case studies, actionable data points. Ruthlessly filter noise.
+
+#DOCUMENT STRUCTURE (assembled elsewhere — context only)
+The final document includes, in order:
+1. TITLE — `# Daily Brief — {brief_date_str}`
+2. KEY NUMBERS — blockquotes with 2–3 striking numeric facts across today's articles (another step)
+3. THEME INDEX — markdown table by theme
+4. ARTICLES — grouped under `## {{theme}}` headers
+
+You supply **classification + per-article content** for step 4 via the field block.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PER-ARTICLE RULES (this email)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- **Article title** — sentence case, specific (this becomes the `###` heading in the brief).
+- **Read time minutes** — integer **2**, **3**, or **4** only:
+  - Short (1–2 thin points) = 2
+  - Standard (3–5 solid points) = 3
+  - Dense (long / technical) = 4
+- **TL;DR** — 2–3 sentences. Concrete numbers, names, or outcomes where they exist. Never vague.
+- **Key insight** — **exactly one sentence**: the single most useful or surprising thing; what to remember if nothing else is read.
+- **Main points** — 3–5 bullets (`- ` lines). Each a complete, concrete sentence — **not** a restatement of the TL;DR. Add a 4th or 5th bullet only if the article is genuinely dense.
+- **Topic** / **Company** — hashtags in kebab-case (e.g. `#openai`). Use `None` if none apply.
+- **Theme** — exactly **one** line from this list (copy spelling and casing exactly):
+{theme_list}
+
+#RULES
+
+NEVER include:
+- Urgency ratings, urgency emojis (🔴🟡⚪), or any urgency field
+- Markdown `###` headings, YAML front matter, or table syntax in your output
+- Placeholder lines like "TBD" or "N/A" except `None` for Topic/Company as specified
+
+ALWAYS:
+- Put **only** the OUTPUT FIELD BLOCK in your response after you decide to keep the email (no preamble)
+- Use sentence case for Article title
 
 DISCARD RULE
 Output the single word SKIP — nothing else — if the email is:
@@ -531,38 +617,22 @@ Output the single word SKIP — nothing else — if the email is:
 - Onboarding drip with no substantive editorial content
 - Transactional (receipts, notifications, confirmations)
 When in doubt, keep it.
+- Do not include placeholder entries.
 
-SUMMARISE RULE
-For emails you keep, produce all six fields below.
+---
 
-Headline — One punchy, specific title (max 10 words). Name the actual subject: a company, stat, framework, or finding. Never start with "This", "How", or "Why".
-
-TL;DR — 2 complete sentences maximum. Lead with the core insight. No vague openers like "This article covers…".
-
-Main Points — 3 to 5 bullets. Each bullet must be one complete sentence with a concrete finding, stat, or action. Omit a bullet entirely rather than writing a vague or incomplete one.
-
-Topic — Up to 3 topic hashtags in kebab-case (e.g. #prompt-engineering, #ai-agents, #product-strategy). Use None if no clear topic applies.
-
-Company — Up to 3 company hashtags in kebab-case (e.g. #openai, #anthropic, #google). Use None if no specific company is a key subject of the article.
-
-Urgency — Exactly one of: High, Medium, Low.
-
-OUTPUT RULES — READ CAREFULLY
-- Output ONLY the six fields in the exact format below
-- Do not write any reasoning, thinking steps, notes to yourself, or commentary outside the fields
-- Do not truncate any field mid-sentence — omit the bullet rather than leaving it incomplete
-- Each Main Points bullet must be a complete sentence
-
-OUTPUT FORMAT:
-Headline: <max 10 words>
-TL;DR: <2 sentences max>
-Main Points:
-- <complete sentence>
-- <complete sentence>
-- <complete sentence>
-Topic: <#hashtag #hashtag or None>
-Company: <#hashtag #hashtag or None>
-Urgency: <High|Medium|Low>
+OUTPUT FIELD BLOCK (required when not SKIP — plain lines only):
+Theme: <one theme from the list above>
+Read minutes: <2|3|4>
+Article title: <sentence case title>
+TL;DR: <2–3 sentences>
+Key insight: <one sentence only>
+Main points:
+- <sentence>
+- <sentence>
+- <sentence>
+Topic: <#tags or None>
+Company: <#tags or None>
 
 Reader persona: {cfg["persona"]}
 
@@ -579,9 +649,11 @@ def _summarise(
     cfg: dict[str, Any],
     client: genai.Client,
     item: EmailItem,
+    *,
+    brief_date_str: str,
 ) -> ScoredSummary | None:
     """Call Gemini to summarise *item*. Returns None if Gemini SKIPped the email."""
-    prompt = _build_summarise_prompt(cfg, item)
+    prompt = _build_summarise_prompt(cfg, item, brief_date_str)
 
     def _call() -> Any:
         return client.models.generate_content(
@@ -601,46 +673,104 @@ def _summarise(
     return _parse_gemini_response(text)
 
 
+def _build_key_numbers_prompt(date_str: str, digest_excerpts: str) -> str:
+    return f"""You are a senior product manager's briefing editor.
+
+Below are excerpts from newsletter articles that will appear in the **Daily Brief — {date_str}**.
+
+Write **only** the "Key numbers" body: **2–3** markdown blockquote lines. Each line must follow this pattern exactly:
+> **{{number or stat}}** — {{one sentence of context}}
+
+Use genuinely striking or significant numbers mentioned in the excerpts. If there are **zero** strong numeric facts, output exactly this single line (italic):
+_No striking numeric facts in today's articles._
+
+Do not add a heading, preamble, or bullet list outside those rules.
+
+---
+
+{digest_excerpts}
+"""
+
+
+def _generate_key_numbers_markdown(
+    cfg: dict[str, Any],
+    client: genai.Client,
+    rows: list[tuple[EmailItem, ScoredSummary, str]],
+    date_str: str,
+) -> str:
+    """Second-pass Gemini call: pull 2–3 numeric highlights across all articles."""
+    if not rows:
+        return ""
+    excerpts: list[str] = []
+    for item, scored, _ in rows:
+        points_join = " ".join(scored.main_points[:5])
+        excerpts.append(
+            f"Article title: {scored.headline}\n"
+            f"TL;DR: {scored.tldr}\n"
+            f"Key insight: {scored.key_insight}\n"
+            f"Main points: {points_join}"
+        )
+    prompt = _build_key_numbers_prompt(date_str, "\n\n---\n\n".join(excerpts))
+
+    def _call() -> Any:
+        return client.models.generate_content(
+            model=cfg["gemini_model"],
+            contents=prompt,
+            config={"max_output_tokens": GEMINI_KEY_NUMBERS_MAX_TOKENS},
+        )
+
+    resp = _with_retry(
+        _call,
+        max_attempts=GEMINI_RETRY_ATTEMPTS,
+        backoff_base=GEMINI_RETRY_BACKOFF,
+        retryable=_RETRYABLE_GEMINI,
+        label="gemini/key_numbers",
+    )
+    return (getattr(resp, "text", "") or "").strip()
+
+
 # ── Markdown ───────────────────────────────────────────────────────────────────
 
 def _gmail_open_url(thread_id: str) -> str:
     return f"https://mail.google.com/mail/u/0/#all/{thread_id}"
 
 
-_URGENCY_ICON = {"High": "🔴", "Medium": "🟡", "Low": "⚪"}
-
-
 def _email_to_markdown_section(item: EmailItem, scored: ScoredSummary, source_label: str) -> str:
-    """Render a single email as a structured Markdown section."""
-    icon = _URGENCY_ICON.get(scored.urgency, "⚪")
+    """Render a single email as a structured Markdown section (Obsidian brief style)."""
     url = _gmail_open_url(item.thread_id)
     display_name = _extract_display_name(item.from_addr)
     display_date = _normalize_date(item.date)
+    rm = max(2, min(4, scored.read_minutes))
 
     lines = [
         f"### {scored.headline}",
-        f"> **From:** {display_name} · **Date:** {display_date} · **Label:** {source_label} · {icon} {scored.urgency}",
+        (
+            f"> **From:** {display_name} · **Date:** {display_date} · **Label:** {source_label} "
+            f"· ⏱ {rm} min read"
+        ),
         "",
     ]
 
-    # Hashtag line — only emit when at least one tag exists
-    tag_parts: list[str] = []
+    tag_line_parts: list[str] = []
     if scored.topics:
-        tag_parts.append("topic: " + " ".join(scored.topics))
+        tag_line_parts.append("topic: " + " ".join(scored.topics))
     if scored.companies:
-        tag_parts.append("company: " + " ".join(scored.companies))
-    if tag_parts:
-        lines.append(" · ".join(tag_parts))
+        tag_line_parts.append("company: " + " ".join(scored.companies))
+    if tag_line_parts:
+        lines.append(" · ".join(tag_line_parts))
         lines.append("")
 
     lines += [
         "**TL;DR**",
         scored.tldr,
         "",
+        "**Key insight**",
+        scored.key_insight or "_No single insight extracted._",
+        "",
     ]
 
     if scored.main_points:
-        lines.append("**Main Points**")
+        lines.append("**Main points**")
         for point in scored.main_points:
             lines.append(f"- {point}")
         lines.append("")
@@ -659,41 +789,58 @@ def _build_daily_brief_markdown(
     label_sections: list[tuple[str, list[tuple[EmailItem, ScoredSummary, str]]]],
     *,
     date_str: str,
+    key_numbers_markdown: str,
 ) -> str:
     """Build the full Obsidian-compatible Markdown document for the daily brief."""
     parts: list[str] = []
 
-    # YAML frontmatter
     parts.append(f"---\ndate: {date_str}\ntags: [daily-brief, email-digest]\n---\n")
 
-    # Title
     parts.append(f"# Daily Brief — {date_str}\n")
 
-    # Index: one line per article across all labels
-    all_rows = [
-        (item, scored)
-        for _, rows in label_sections
-        for item, scored, _ in rows
-    ]
-    if all_rows:
-        parts.append("## Articles Processed\n")
-        for i, (item, scored) in enumerate(all_rows, start=1):
-            display_name = _extract_display_name(item.from_addr)
-            display_date = _normalize_date(item.date)
-            parts.append(f"{i}. **{scored.headline}** — {display_name} · {display_date}")
-        parts.append("\n---\n")
+    parts.append("## Key numbers\n\n")
+    if key_numbers_markdown.strip():
+        parts.append(key_numbers_markdown.strip() + "\n\n")
+    else:
+        parts.append("_No striking numeric facts in today's articles._\n\n")
 
-    # Per-label detailed sections
-    for label_name, rows in label_sections:
-        parts.append(f"## {label_name}\n")
-        if not rows:
-            parts.append("_No qualifying emails for this period._\n")
-            parts.append("---\n")
+    all_rows: list[tuple[EmailItem, ScoredSummary, str]] = [
+        (item, scored, sl)
+        for _, rows in label_sections
+        for item, scored, sl in rows
+    ]
+
+    parts.append("## Today's reading\n\n")
+    if not all_rows:
+        parts.append("_No qualifying emails for this period._\n")
+        return "".join(parts)
+
+    parts.append("| Theme | Article | Source | Read time |\n")
+    parts.append("|-------|---------|--------|----------|\n")
+    for item, scored, _sl in sorted(all_rows, key=lambda r: _email_sort_timestamp(r[0]), reverse=True):
+        theme = scored.theme
+        title = scored.headline.replace("|", "\\|")
+        src = _extract_display_name(item.from_addr).replace("|", "\\|")
+        parts.append(f"| {theme} | {title} | {src} | {scored.read_minutes} min |\n")
+    parts.append("\n")
+
+    by_theme: dict[str, list[tuple[EmailItem, ScoredSummary, str]]] = {t: [] for t in THEME_SECTION_ORDER}
+    for item, scored, sl in all_rows:
+        th = scored.theme if scored.theme in by_theme else _normalize_theme(scored.theme)
+        if th not in by_theme:
+            th = _DEFAULT_THEME
+        by_theme[th].append((item, scored, sl))
+
+    for theme in THEME_SECTION_ORDER:
+        bucket = by_theme.get(theme, [])
+        if not bucket:
             continue
-        for item, scored, source_label in rows:
+        parts.append(f"## {theme}\n\n")
+        bucket.sort(key=lambda row: _email_sort_timestamp(row[0]), reverse=True)
+        for item, scored, source_label in bucket:
             parts.append(_email_to_markdown_section(item, scored, source_label))
 
-    return "\n".join(parts)
+    return "".join(parts)
 
 
 # ── Dropbox ────────────────────────────────────────────────────────────────────
@@ -741,6 +888,7 @@ def _upload_to_dropbox(cfg: dict[str, Any], content: str, filename: str) -> bool
 
 def main() -> int:
     cfg = _load_config()
+    brief_date = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
     print(
         "[config] "
         + f"labels={cfg['labels']!r} date_window_days={cfg['date_window_days']} "
@@ -837,7 +985,7 @@ def main() -> int:
 
         with ThreadPoolExecutor(max_workers=GEMINI_MAX_WORKERS) as executor:
             futures = [
-                executor.submit(_summarise, cfg, gemini_client, item)
+                executor.submit(_summarise, cfg, gemini_client, item, brief_date_str=brief_date)
                 for item, _ in items_to_summarise
             ]
             for future, (item, source_label_name) in zip(futures, items_to_summarise):
@@ -863,9 +1011,23 @@ def main() -> int:
         )
         label_sections.append((parent_label, rows))
 
-    date_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
-    filename = f"{date_str}-daily-brief.md"
-    markdown = _build_daily_brief_markdown(label_sections, date_str=date_str)
+    all_rows_flat: list[tuple[EmailItem, ScoredSummary, str]] = [
+        (item, scored, sl)
+        for _, rows in label_sections
+        for item, scored, sl in rows
+    ]
+    key_numbers_md = ""
+    if all_rows_flat:
+        key_numbers_md = _generate_key_numbers_markdown(
+            cfg, gemini_client, all_rows_flat, brief_date
+        )
+
+    filename = f"{brief_date}-daily-brief.md"
+    markdown = _build_daily_brief_markdown(
+        label_sections,
+        date_str=brief_date,
+        key_numbers_markdown=key_numbers_md,
+    )
 
     _debug(f"[markdown] built brief: {len(markdown)} chars")
 

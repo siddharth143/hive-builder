@@ -234,16 +234,18 @@ def test_parse_hashtags_single_tag():
 # ── _parse_gemini_response ─────────────────────────────────────────────────────
 
 _VALID_RESPONSE = (
-    "Headline: Anthropic Surpasses OpenAI in Enterprise Revenue\n"
+    "Theme: AI product strategy & agents\n"
+    "Read minutes: 3\n"
+    "Article title: Anthropic surpasses OpenAI in enterprise revenue\n"
     "TL;DR: Anthropic has reached a $30B run-rate, overtaking OpenAI's $24B. "
     "Enterprise adoption of Claude is accelerating faster than GPT-4 equivalents.\n"
-    "Main Points:\n"
+    "Key insight: Anthropic's enterprise positioning now translates into higher run-rate revenue than OpenAI.\n"
+    "Main points:\n"
     "- Anthropic's revenue run-rate hit $30B, ahead of OpenAI's $24B.\n"
     "- Safety-focused positioning is winning enterprise procurement teams.\n"
     "- OpenAI faces internal friction with CFO excluded from strategic decisions.\n"
     "Topic: #ai-industry #revenue\n"
     "Company: #anthropic #openai\n"
-    "Urgency: High\n"
 )
 
 
@@ -259,10 +261,10 @@ def test_parse_gemini_response_skip_with_trailing_newline():
     assert _parse_gemini_response("SKIP\n") is None
 
 
-def test_parse_gemini_response_valid_headline():
+def test_parse_gemini_response_valid_article_title():
     result = _parse_gemini_response(_VALID_RESPONSE)
     assert result is not None
-    assert result.headline == "Anthropic Surpasses OpenAI in Enterprise Revenue"
+    assert result.headline == "Anthropic surpasses OpenAI in enterprise revenue"
 
 
 def test_parse_gemini_response_valid_tldr():
@@ -292,27 +294,45 @@ def test_parse_gemini_response_valid_companies():
     assert "#openai" in result.companies
 
 
-def test_parse_gemini_response_valid_urgency():
+def test_parse_gemini_response_valid_theme_and_read_minutes():
     result = _parse_gemini_response(_VALID_RESPONSE)
     assert result is not None
-    assert result.urgency == "High"
+    assert result.theme == "AI product strategy & agents"
+    assert result.read_minutes == 3
 
 
-def test_parse_gemini_response_no_relevance_field():
-    """Relevance has been removed — responses without it should parse fine."""
+def test_parse_gemini_response_valid_key_insight():
     result = _parse_gemini_response(_VALID_RESPONSE)
     assert result is not None
-    assert not hasattr(result, "relevance")
+    assert "Anthropic" in result.key_insight
+
+
+def test_parse_gemini_response_accepts_legacy_headline_label():
+    text = (
+        "Theme: Vibe coding\n"
+        "Read minutes: 2\n"
+        "Headline: Legacy title field still works\n"
+        "TL;DR: One. Two.\n"
+        "Key insight: Single sentence here.\n"
+        "Main points:\n- A.\n"
+        "Topic: None\n"
+        "Company: None\n"
+    )
+    result = _parse_gemini_response(text)
+    assert result is not None
+    assert result.headline == "Legacy title field still works"
 
 
 def test_parse_gemini_response_topic_none_returns_empty_list():
     text = (
-        "Headline: A headline\n"
+        "Theme: AI Models\n"
+        "Read minutes: 3\n"
+        "Article title: A headline\n"
         "TL;DR: A summary.\n"
-        "Main Points:\n- Point one.\n"
+        "Key insight: One sentence.\n"
+        "Main points:\n- Point one.\n"
         "Topic: None\n"
         "Company: #openai\n"
-        "Urgency: Low\n"
     )
     result = _parse_gemini_response(text)
     assert result is not None
@@ -321,47 +341,28 @@ def test_parse_gemini_response_topic_none_returns_empty_list():
 
 def test_parse_gemini_response_company_none_returns_empty_list():
     text = (
-        "Headline: A headline\n"
+        "Theme: AI Models\n"
+        "Read minutes: 3\n"
+        "Article title: A headline\n"
         "TL;DR: A summary.\n"
-        "Main Points:\n- Point one.\n"
+        "Key insight: One sentence.\n"
+        "Main points:\n- Point one.\n"
         "Topic: #ai-agents\n"
         "Company: None\n"
-        "Urgency: Medium\n"
     )
     result = _parse_gemini_response(text)
     assert result is not None
     assert result.companies == []
-
-
-def test_parse_gemini_response_case_insensitive_urgency():
-    text = (
-        "Headline: H\nTL;DR: S.\nMain Points:\n- P.\n"
-        "Topic: None\nCompany: None\nUrgency: high\n"
-    )
-    result = _parse_gemini_response(text)
-    assert result is not None
-    assert result.urgency == "High"
-
-
-def test_parse_gemini_response_all_urgency_values():
-    for urg in ("High", "Medium", "Low"):
-        text = (
-            f"Headline: H\nTL;DR: S.\nMain Points:\n- P.\n"
-            f"Topic: None\nCompany: None\nUrgency: {urg}\n"
-        )
-        result = _parse_gemini_response(text)
-        assert result is not None
-        assert result.urgency == urg
 
 
 def test_parse_gemini_response_fallback_on_malformed():
     text = "This is just some random text without structure."
     result = _parse_gemini_response(text)
     assert result is not None
-    assert result.urgency == "Low"
     assert text in result.tldr
     assert result.topics == []
     assert result.companies == []
+    assert result.read_minutes == 3
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -380,19 +381,23 @@ def _make_item(subject: str = "Test Subject") -> EmailItem:
 
 def _make_scored(
     headline: str = "A great insight on product thinking",
+    theme: str = "AI Product Management",
+    read_minutes: int = 3,
     tldr: str = "A concise high-level summary.",
+    key_insight: str = "The single most useful takeaway.",
     main_points: list | None = None,
     topics: list | None = None,
     companies: list | None = None,
-    urgency: str = "Low",
 ) -> ScoredSummary:
     return ScoredSummary(
         headline=headline,
+        theme=theme,
+        read_minutes=read_minutes,
         tldr=tldr,
+        key_insight=key_insight,
         main_points=main_points if main_points is not None else ["Point one.", "Point two."],
         topics=topics if topics is not None else ["#ai-agents"],
         companies=companies if companies is not None else ["#openai"],
-        urgency=urgency,
     )
 
 
@@ -415,9 +420,10 @@ def test_email_to_markdown_section_shows_normalized_date():
     assert "+0000" not in md
 
 
-def test_email_to_markdown_section_shows_label():
-    md = _email_to_markdown_section(_make_item(), _make_scored(), "Education/Newsletter")
+def test_email_to_markdown_section_shows_label_and_read_time():
+    md = _email_to_markdown_section(_make_item(), _make_scored(read_minutes=3), "Education/Newsletter")
     assert "Education/Newsletter" in md
+    assert "⏱ 3 min read" in md
 
 
 def test_email_to_markdown_section_topic_hashtags():
@@ -449,7 +455,7 @@ def test_email_to_markdown_section_tldr_section():
 def test_email_to_markdown_section_main_points():
     scored = _make_scored(main_points=["Alpha is first.", "Beta is second."])
     md = _email_to_markdown_section(_make_item(), scored, "L")
-    assert "**Main Points**" in md
+    assert "**Main points**" in md
     assert "- Alpha is first." in md
     assert "- Beta is second." in md
 
@@ -457,7 +463,7 @@ def test_email_to_markdown_section_main_points():
 def test_email_to_markdown_section_no_main_points_header_when_empty():
     scored = _make_scored(main_points=[])
     md = _email_to_markdown_section(_make_item(), scored, "L")
-    assert "**Main Points**" not in md
+    assert "**Main points**" not in md
 
 
 def test_email_to_markdown_section_gmail_link_last():
@@ -467,9 +473,17 @@ def test_email_to_markdown_section_gmail_link_last():
     assert md.index("Open in Gmail") > md.index("TL;DR")
 
 
-def test_email_to_markdown_section_high_urgency_red_dot():
-    md = _email_to_markdown_section(_make_item(), _make_scored(urgency="High"), "L")
-    assert "🔴" in md
+def test_email_to_markdown_section_key_insight_block():
+    md = _email_to_markdown_section(_make_item(), _make_scored(key_insight="Remember this."), "L")
+    assert "**Key insight**" in md
+    assert "Remember this." in md
+
+
+def test_email_to_markdown_section_no_urgency_icons():
+    md = _email_to_markdown_section(_make_item(), _make_scored(), "L")
+    assert "🔴" not in md
+    assert "🟡" not in md
+    assert "⚪" not in md
 
 
 def test_email_to_markdown_section_no_relevance_score():
@@ -481,79 +495,105 @@ def test_email_to_markdown_section_no_relevance_score():
 # ── _build_daily_brief_markdown ────────────────────────────────────────────────
 
 def test_build_daily_brief_markdown_has_frontmatter():
-    md = _build_daily_brief_markdown([], date_str="2024-01-01")
+    md = _build_daily_brief_markdown([], date_str="2024-01-01", key_numbers_markdown="")
     assert md.startswith("---\n")
     assert "date: 2024-01-01" in md
 
 
 def test_build_daily_brief_markdown_has_title():
-    md = _build_daily_brief_markdown([], date_str="2024-01-15")
+    md = _build_daily_brief_markdown([], date_str="2024-01-15", key_numbers_markdown="")
     assert "# Daily Brief — 2024-01-15" in md
 
 
-def test_build_daily_brief_markdown_index_section():
-    rows = [(_make_item(), _make_scored(headline="AI Strategy Insight"), "L")]
-    md = _build_daily_brief_markdown([("Education", rows)], date_str="2024-01-01")
-    assert "## Articles Processed" in md
-    assert "AI Strategy Insight" in md
+def test_build_daily_brief_markdown_has_key_numbers_section():
+    md = _build_daily_brief_markdown([], date_str="2024-01-01", key_numbers_markdown="")
+    assert "## Key numbers" in md
+
+
+def test_build_daily_brief_markdown_key_numbers_custom_content():
+    kn = "> **40%** — Share of enterprise pilots won by vendor X."
+    md = _build_daily_brief_markdown([], date_str="2024-01-01", key_numbers_markdown=kn)
+    assert "40%" in md
+
+
+def test_build_daily_brief_markdown_theme_index_table():
+    rows = [(_make_item(), _make_scored(headline="AI strategy insight", theme="AI Models"), "L")]
+    md = _build_daily_brief_markdown([("Education", rows)], date_str="2024-01-01", key_numbers_markdown="")
+    assert "## Today's reading" in md
+    assert "| Theme | Article | Source | Read time |" in md
+    assert "AI strategy insight" in md
+    assert "AI Models" in md
 
 
 def test_build_daily_brief_markdown_index_uses_display_name():
-    rows = [(_make_item(), _make_scored(), "L")]
-    md = _build_daily_brief_markdown([("Education", rows)], date_str="2024-01-01")
-    index_section = md.split("## Articles Processed")[1].split("## Education")[0]
-    assert "ByteByteGo" in index_section
-    assert "bytebytego@substack.com" not in index_section
+    rows = [(_make_item(), _make_scored(theme="Vibe coding"), "L")]
+    md = _build_daily_brief_markdown([("Education", rows)], date_str="2024-01-01", key_numbers_markdown="")
+    table_part = md.split("## Today's reading")[1].split("## Vibe coding")[0]
+    assert "ByteByteGo" in table_part
+    assert "bytebytego@substack.com" not in table_part
 
 
-def test_build_daily_brief_markdown_index_uses_normalized_date():
-    rows = [(_make_item(), _make_scored(), "L")]
-    md = _build_daily_brief_markdown([("Education", rows)], date_str="2024-01-01")
-    index_section = md.split("## Articles Processed")[1].split("## Education")[0]
-    assert "11 Apr 2026" in index_section
-    assert "+0000" not in index_section
+def test_build_daily_brief_markdown_theme_section_contains_article():
+    rows = [(_make_item(), _make_scored(headline="My article", theme="Vibe coding"), "L")]
+    md = _build_daily_brief_markdown([("Education", rows)], date_str="2024-01-01", key_numbers_markdown="")
+    assert "## Vibe coding" in md
+    assert "### My article" in md
 
 
-def test_build_daily_brief_markdown_index_numbered():
+def test_build_daily_brief_markdown_multiple_articles_same_theme_sorted():
+    item_a = _make_item()
+    item_b = EmailItem(
+        msg_id="msg2",
+        thread_id="thread2",
+        subject="Older",
+        from_addr="ByteByteGo <bytebytego@substack.com>",
+        date="Fri, 10 Apr 2026 12:00:00 +0000",
+        snippet="s",
+        body="b",
+    )
     rows = [
-        (_make_item(), _make_scored(headline="First"), "L"),
-        (_make_item(), _make_scored(headline="Second"), "L"),
+        (item_a, _make_scored(headline="Newer piece", theme="AI Models"), "L"),
+        (item_b, _make_scored(headline="Older piece", theme="AI Models"), "L"),
     ]
-    md = _build_daily_brief_markdown([("L", rows)], date_str="2024-01-01")
-    assert "1. **First**" in md
-    assert "2. **Second**" in md
+    md = _build_daily_brief_markdown([("L", rows)], date_str="2024-01-01", key_numbers_markdown="")
+    theme_block = md.split("## AI Models")[1]
+    assert theme_block.index("### Newer piece") < theme_block.index("### Older piece")
 
 
-def test_build_daily_brief_markdown_no_index_when_no_emails():
-    md = _build_daily_brief_markdown([("Education", [])], date_str="2024-01-01")
-    assert "## Articles Processed" not in md
-
-
-def test_build_daily_brief_markdown_empty_label_placeholder():
-    md = _build_daily_brief_markdown([("Education", [])], date_str="2024-01-01")
+def test_build_daily_brief_markdown_empty_placeholder():
+    md = _build_daily_brief_markdown([("Education", [])], date_str="2024-01-01", key_numbers_markdown="")
     assert "No qualifying emails" in md
 
 
-def test_build_daily_brief_markdown_multiple_labels():
-    rows1 = [(_make_item(), _make_scored(headline="Headline A"), "L1")]
-    rows2 = [(_make_item(), _make_scored(headline="Headline B"), "L2")]
-    md = _build_daily_brief_markdown(
-        [("Label1", rows1), ("Label2", rows2)], date_str="2024-01-01"
+def test_build_daily_brief_markdown_multiple_labels_merge_by_theme():
+    rows1 = [(_make_item(), _make_scored(headline="Headline A", theme="AI Models"), "L1")]
+    item_b = EmailItem(
+        msg_id="m2",
+        thread_id="t2",
+        subject="S2",
+        from_addr="Other <o@example.com>",
+        date="Sat, 11 Apr 2026 16:00:00 +0000",
+        snippet="x",
+        body="y",
     )
-    assert "## Label1" in md
-    assert "## Label2" in md
+    rows2 = [(item_b, _make_scored(headline="Headline B", theme="Vibe coding"), "L2")]
+    md = _build_daily_brief_markdown(
+        [("Label1", rows1), ("Label2", rows2)], date_str="2024-01-01", key_numbers_markdown=""
+    )
+    assert "## AI Models" in md
+    assert "## Vibe coding" in md
     assert "Headline A" in md
     assert "Headline B" in md
 
 
-def test_build_daily_brief_markdown_index_before_sections():
-    rows = [(_make_item(), _make_scored(headline="Test"), "L")]
-    md = _build_daily_brief_markdown([("Education", rows)], date_str="2024-01-01")
-    assert md.index("Articles Processed") < md.index("## Education")
+def test_build_daily_brief_markdown_reading_before_theme_body():
+    rows = [(_make_item(), _make_scored(headline="Test", theme="AI Models"), "L")]
+    md = _build_daily_brief_markdown([("Education", rows)], date_str="2024-01-01", key_numbers_markdown="")
+    assert md.index("Today's reading") < md.index("## AI Models")
 
 
 def test_build_daily_brief_markdown_no_relevance_anywhere():
     """Relevance scores must not appear anywhere in the document."""
     rows = [(_make_item(), _make_scored(), "L")]
-    md = _build_daily_brief_markdown([("Education", rows)], date_str="2024-01-01")
+    md = _build_daily_brief_markdown([("Education", rows)], date_str="2024-01-01", key_numbers_markdown="")
     assert "/5" not in md
