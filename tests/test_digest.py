@@ -17,6 +17,7 @@ from digest import (
     _parse_csv_env,
     _parse_gemini_response,
     _parse_hashtags,
+    _sanitize_key_numbers_markdown,
     _truncate,
 )
 
@@ -493,6 +494,28 @@ def test_email_to_markdown_section_no_relevance_score():
 
 
 # ── _build_daily_brief_markdown ────────────────────────────────────────────────
+
+def test_sanitize_key_numbers_markdown_passes_valid_lines():
+    raw = (
+        "> **42%** — Context one.\n"
+        "> **$3.2B** — Context two.\n"
+        "> **128k tokens** — Context three."
+    )
+    out = _sanitize_key_numbers_markdown(raw)
+    assert out.count("\n") == 2
+    assert "42%" in out
+    assert "$3.2B" in out
+
+
+def test_sanitize_key_numbers_markdown_rejects_non_numeric_stat():
+    raw = "> **A launch window** — Not numeric.\n> **Another phrase** — Also not numeric."
+    assert _sanitize_key_numbers_markdown(raw) == ""
+
+
+def test_sanitize_key_numbers_markdown_rejects_chatty_model_output():
+    raw = "\" a strong numeric fact? Yes, it's a launch window."
+    assert _sanitize_key_numbers_markdown(raw) == ""
+
 
 def test_build_daily_brief_markdown_has_frontmatter():
     md = _build_daily_brief_markdown([], date_str="2024-01-01", key_numbers_markdown="")

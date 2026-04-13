@@ -718,7 +718,8 @@ Below are excerpts from newsletter articles that will appear in the **Daily Brie
 Write **only** the "Key numbers" body: **2–3** markdown blockquote lines. Each line must follow this pattern exactly:
 > **{{number or stat}}** — {{one sentence of context}}
 
-Use genuinely striking or significant numbers mentioned in the excerpts. If there are **zero** strong numeric facts, output exactly this single line (italic):
+Use genuinely striking or significant numbers mentioned in the excerpts.
+If there are fewer than **2** strong numeric facts, output exactly this single line (italic):
 _No striking numeric facts in today's articles._
 
 Do not add a heading, preamble, or bullet list outside those rules.
@@ -727,6 +728,41 @@ Do not add a heading, preamble, or bullet list outside those rules.
 
 {digest_excerpts}
 """
+
+
+def _sanitize_key_numbers_markdown(raw: str) -> str:
+    """
+    Enforce key-number section formatting.
+
+    Accept only lines shaped like:
+      > **<numeric stat>** — <context sentence>
+    Keep at most 3 lines. If we cannot recover at least 2 valid lines, return "".
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    if text == "_No striking numeric facts in today's articles._":
+        return text
+
+    valid_lines: list[str] = []
+    for line in text.splitlines():
+        ln = line.strip().strip('"').strip("'")
+        if not ln:
+            continue
+        m = re.match(r"^>\s*\*\*(.+?)\*\*\s+—\s+(.+)$", ln)
+        if not m:
+            continue
+        stat = m.group(1).strip()
+        context = m.group(2).strip()
+        if not re.search(r"\d", stat):
+            continue
+        valid_lines.append(f"> **{stat}** — {context}")
+        if len(valid_lines) == 3:
+            break
+
+    if len(valid_lines) < 2:
+        return ""
+    return "\n".join(valid_lines)
 
 
 def _generate_key_numbers_markdown(
@@ -747,7 +783,11 @@ def _generate_key_numbers_markdown(
             f"Key insight: {scored.key_insight}\n"
             f"Main points: {points_join}"
         )
-    prompt = _build_key_numbers_prompt(date_str, "\n\n---\n\n".join(excerpts))
+    excerpts_text = "\n\n---\n\n".join(excerpts)
+    if not re.search(r"\d", excerpts_text):
+        return ""
+
+    prompt = _build_key_numbers_prompt(date_str, excerpts_text)
 
     def _call() -> Any:
         return client.models.generate_content(
@@ -763,7 +803,8 @@ def _generate_key_numbers_markdown(
         retryable=_RETRYABLE_GEMINI,
         label="gemini/key_numbers",
     )
-    return (getattr(resp, "text", "") or "").strip()
+    raw = (getattr(resp, "text", "") or "").strip()
+    return _sanitize_key_numbers_markdown(raw)
 
 
 # ── Markdown ───────────────────────────────────────────────────────────────────
