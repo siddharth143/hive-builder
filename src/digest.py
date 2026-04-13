@@ -280,7 +280,6 @@ def _load_config() -> dict[str, Any]:
             "GEMINI_API_KEY",
             "GEMINI_MODEL",
             "SUMMARISATION_PERSONA",
-            "DROPBOX_ACCESS_TOKEN",
             "DROPBOX_FOLDER_PATH",
         )
         if not (os.environ.get(k) or "").strip()
@@ -305,6 +304,41 @@ def _load_config() -> dict[str, Any]:
         raise SystemExit(1)
     max_emails = max(1, min(max_emails, 500))
 
+    dropbox_access_token = (os.environ.get("DROPBOX_ACCESS_TOKEN") or "").strip()
+    dropbox_refresh_token = (os.environ.get("DROPBOX_REFRESH_TOKEN") or "").strip()
+    dropbox_app_key = (os.environ.get("DROPBOX_APP_KEY") or "").strip()
+    dropbox_app_secret = (os.environ.get("DROPBOX_APP_SECRET") or "").strip()
+
+    has_refresh_set = all([dropbox_refresh_token, dropbox_app_key, dropbox_app_secret])
+    has_any_refresh_field = any([dropbox_refresh_token, dropbox_app_key, dropbox_app_secret])
+
+    if not dropbox_access_token and not has_refresh_set:
+        if has_any_refresh_field:
+            missing_refresh = [
+                k
+                for k, v in (
+                    ("DROPBOX_REFRESH_TOKEN", dropbox_refresh_token),
+                    ("DROPBOX_APP_KEY", dropbox_app_key),
+                    ("DROPBOX_APP_SECRET", dropbox_app_secret),
+                )
+                if not v
+            ]
+            print(
+                "Dropbox auth is partially configured. Provide either:\n"
+                "  - DROPBOX_ACCESS_TOKEN\n"
+                "  - OR all of DROPBOX_REFRESH_TOKEN, DROPBOX_APP_KEY, DROPBOX_APP_SECRET\n"
+                f"Missing from refresh-token set: {', '.join(missing_refresh)}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Missing Dropbox auth configuration. Provide either:\n"
+                "  - DROPBOX_ACCESS_TOKEN\n"
+                "  - OR all of DROPBOX_REFRESH_TOKEN, DROPBOX_APP_KEY, DROPBOX_APP_SECRET",
+                file=sys.stderr,
+            )
+        raise SystemExit(1)
+
     return {
         "gmail_client_id": os.environ["GMAIL_CLIENT_ID"].strip(),
         "gmail_client_secret": os.environ["GMAIL_CLIENT_SECRET"].strip(),
@@ -315,7 +349,10 @@ def _load_config() -> dict[str, Any]:
         "gemini_api_key": os.environ["GEMINI_API_KEY"].strip(),
         "gemini_model": os.environ["GEMINI_MODEL"].strip(),
         "persona": os.environ["SUMMARISATION_PERSONA"].strip(),
-        "dropbox_access_token": os.environ["DROPBOX_ACCESS_TOKEN"].strip(),
+        "dropbox_access_token": dropbox_access_token,
+        "dropbox_refresh_token": dropbox_refresh_token,
+        "dropbox_app_key": dropbox_app_key,
+        "dropbox_app_secret": dropbox_app_secret,
         "dropbox_folder_path": os.environ["DROPBOX_FOLDER_PATH"].strip().rstrip("/"),
         "max_emails_per_label": max_emails,
     }
@@ -858,7 +895,27 @@ def _upload_to_dropbox(cfg: dict[str, Any], content: str, filename: str) -> bool
     data = content.encode("utf-8")
 
     try:
-        dbx = dropbox_sdk.Dropbox(oauth2_access_token=cfg["dropbox_access_token"])
+        # Prefer refresh-token auth for long-running automation in CI.
+        if (
+            cfg.get("dropbox_refresh_token")
+            and cfg.get("dropbox_app_key")
+            and cfg.get("dropbox_app_secret")
+        ):
+            dbx = dropbox_sdk.Dropbox(
+                oauth2_refresh_token=cfg["dropbox_refresh_token"],
+                app_key=cfg["dropbox_app_key"],
+                app_secret=cfg["dropbox_app_secret"],
+            )
+        elif cfg.get("dropbox_access_token"):
+            dbx = dropbox_sdk.Dropbox(oauth2_access_token=cfg["dropbox_access_token"])
+        else:
+            print(
+                "Dropbox auth configuration missing at upload time. "
+                "Set DROPBOX_ACCESS_TOKEN or "
+                "DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET.",
+                file=sys.stderr,
+            )
+            return False
 
         def _do_upload() -> None:
             dbx.files_upload(data, path, mode=WriteMode("overwrite"))
@@ -874,7 +931,9 @@ def _upload_to_dropbox(cfg: dict[str, Any], content: str, filename: str) -> bool
         return True
     except AuthError as e:
         print(
-            f"Dropbox authentication failed. Check DROPBOX_ACCESS_TOKEN.\n"
+            "Dropbox authentication failed. Check DROPBOX credentials "
+            "(preferred: DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET; "
+            "fallback: DROPBOX_ACCESS_TOKEN).\n"
             f"Underlying error: {e}",
             file=sys.stderr,
         )
