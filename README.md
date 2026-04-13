@@ -1,161 +1,156 @@
-## Gmail Digest Action
+# Daily Gmail Brief to Dropbox
 
-A lightweight GitHub Actions workflow that **fetches recent Gmail messages from selected labels**, filters for signal, generates **PM‑oriented summaries with Gemini**, and writes an **Obsidian‑friendly Markdown daily brief** to **Dropbox**.
+Automated daily workflow that reads Gmail newsletters, filters noise, summarizes with Gemini, and writes an Obsidian-friendly Markdown brief to Dropbox.
 
-This repo is designed to be fork‑and‑go: you configure a handful of GitHub Secrets, and the scheduled workflow runs automatically.
+## What This Workflow Does
 
----
+1. Triggers on schedule (daily) or manual run.
+2. Authenticates to Gmail with OAuth refresh token.
+3. Pulls messages for each configured parent label (including sublabels).
+4. Applies keyword filtering to remove obvious low-signal messages.
+5. Summarizes each retained message using Gemini into structured fields.
+6. Builds a daily brief with:
+   - title
+   - key numbers
+   - theme index table
+   - per-article sections grouped by theme
+7. Uploads `YYYY-MM-DD-daily-brief.md` to Dropbox.
 
-## What it does
+## Architecture Diagram
 
-- **Gmail**: Reads messages from the last \(N\) days for each label in `GMAIL_LABELS`.
-  - Supports **hierarchical labels**: if you specify `AI Product Management`, it also includes `AI Product Management/...`.
-- **Filter**: Removes obvious noise using keyword matching on subject/snippet.
-- **Summarize + score**: Uses Gemini to produce a concise summary plus:
-  - **Relevance** \(1–5\)
-  - **Urgency** \(High / Medium / Low\)
-- **Dropbox**: Uploads the brief as dated Markdown (`YYYY-MM-DD-daily-brief.md`) under `DROPBOX_FOLDER_PATH` (for example inside a synced Obsidian vault).
-
----
-
-## How the “agentic” workflow works (high level)
-
-The workflow behaves like a small agentic pipeline:
-
-- **Observe**: pull candidate messages from Gmail by label and time window
-- **Decide**: drop low‑signal items via deterministic filters and model judgement (`SKIP`)
-- **Synthesize**: summarize remaining emails in a consistent, PM‑friendly format
-- **Deliver**: upload the Markdown brief to Dropbox for sync and reading in Obsidian (or any editor)
-
-It’s intentionally simple: the “agent” is the script + prompt, running on a schedule, producing repeatable output.
-
----
-
-## Repo layout
-
-```text
-.github/workflows/daily-digest.yml   # scheduled + manual workflow
-src/digest.py                        # fetch → filter → summarise → Dropbox
-requirements.txt                     # Python dependencies
-.env.example                         # config template (no secrets)
+```mermaid
+flowchart TD
+    A[GitHub Actions\nDaily Gmail digest] --> B[Python runner\nsrc/digest.py]
+    B --> C[Gmail API\nmessages + labels]
+    B --> D[Filter stage\nkeywords + dedupe]
+    D --> E[Gemini summarization\nper-email structured output]
+    E --> F[Brief builder\nmarkdown assembly]
+    F --> G[Gemini key-numbers pass\n2-3 numeric highlights]
+    G --> H[Final markdown\nDaily Brief]
+    H --> I[Dropbox upload\nDROPBOX_FOLDER_PATH]
 ```
 
----
+## Repository Layout
 
-## Quickstart (fork + run)
+```text
+.github/workflows/daily-digest.yml   # schedule + manual workflow
+src/digest.py                        # fetch -> filter -> summarize -> build -> upload
+.env.example                         # local template (no real secrets)
+requirements.txt
+tests/test_digest.py
+```
 
-### 1) Fork this repository
+## Secure Setup (Step by Step)
 
-Fork to your GitHub account (or org) so the workflow can run under your ownership.
+### 1) Fork or clone the repository
 
-### 2) Add GitHub Actions secrets
+Use your own GitHub repository so Actions and secrets are under your control.
 
-In your forked repo:
+### 2) Configure Gmail OAuth (Google Cloud)
 
-- **Settings → Secrets and variables → Actions → Repository secrets**
+1. Create/select a Google Cloud project.
+2. Enable Gmail API.
+3. Create one OAuth client (Web or Desktop).
+4. Generate a refresh token for `https://www.googleapis.com/auth/gmail.readonly`.
+5. Keep client ID, client secret, and refresh token from the same OAuth client.
 
-Create secrets for each key in `.env.example` \(names must match exactly\). You’ll typically need:
+### 3) Configure Gemini API
 
-- **Gmail OAuth**: `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`
-- **Gemini**: `GEMINI_API_KEY`, `GEMINI_MODEL`
-- **Dropbox**: `DROPBOX_ACCESS_TOKEN`, `DROPBOX_FOLDER_PATH`
-- **Config**: `GMAIL_LABELS`, `DATE_WINDOW_DAYS`, `FILTER_KEYWORDS`, `MAX_EMAILS_PER_LABEL`, `SUMMARISATION_PERSONA`
-- **Optional**: `DEBUG`
+Create an API key for Gemini and choose a model (for example `gemini-flash-latest`).
 
-Notes:
+### 4) Configure Dropbox OAuth (recommended: refresh-token auth)
 
-- **Never commit real secrets** (not in Markdown, not in `.env.example`, not in issues or PR descriptions). Use a local `.env` file (gitignored) and **GitHub Actions encrypted secrets** in CI.
-- **Never `git add -f .env`**. If GitHub push protection blocks a push, remove secrets from the commit and rotate any credential that appeared in history or chat logs.
-- If a secret is missing, the script exits with a non‑zero code and the run fails.
+Use refresh-token credentials for long-term stability (no daily token breakage):
 
-### 3) Trigger a manual run (recommended)
+- `DROPBOX_REFRESH_TOKEN`
+- `DROPBOX_APP_KEY`
+- `DROPBOX_APP_SECRET`
 
-Go to:
+Optional fallback:
 
-- **Actions → Daily Gmail digest → Run workflow**
+- `DROPBOX_ACCESS_TOKEN` (short-lived in many setups)
 
-This validates your secrets/config before waiting for the cron schedule.
+### 5) Add GitHub Actions secrets
 
-### 4) Let the schedule run
+In GitHub: `Settings -> Secrets and variables -> Actions -> New repository secret`
 
-The workflow is configured to run daily at **9:00 AM IST** and also supports manual triggers:
+Required core:
 
-- File: `.github/workflows/daily-digest.yml`
+- `GMAIL_CLIENT_ID`
+- `GMAIL_CLIENT_SECRET`
+- `GMAIL_REFRESH_TOKEN`
+- `GEMINI_API_KEY`
+- `GEMINI_MODEL`
+- `SUMMARISATION_PERSONA`
+- `GMAIL_LABELS`
+- `DROPBOX_FOLDER_PATH`
 
----
+Required Dropbox auth (recommended path):
 
-## Local development (optional)
+- `DROPBOX_REFRESH_TOKEN`
+- `DROPBOX_APP_KEY`
+- `DROPBOX_APP_SECRET`
 
-1. Create a virtual environment and install dependencies:
+Optional:
+
+- `DROPBOX_ACCESS_TOKEN` (fallback only)
+- `DATE_WINDOW_DAYS`
+- `FILTER_KEYWORDS`
+- `MAX_EMAILS_PER_LABEL`
+- `DEBUG`
+
+### 6) Validate with a manual workflow run
+
+1. Go to `Actions -> Daily Gmail digest -> Run workflow`.
+2. Verify logs show:
+   - labels resolved
+   - emails fetched and summarized
+   - final Dropbox upload success
+
+### 7) Let schedule run daily
+
+The workflow cron is in `.github/workflows/daily-digest.yml` and runs automatically once configured.
+
+## Local Run (Optional)
 
 ```bash
 python -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-```
-
-2. Copy `.env.example` to `.env` and fill values locally:
-
-```bash
 cp .env.example .env
-```
-
-3. Run:
-
-```bash
 python src/digest.py
 ```
 
-4. Run unit tests (optional):
+Unit tests:
 
 ```bash
 pip install -r requirements-dev.txt
 pytest
 ```
 
----
+## Configuration Reference
 
-## Configuration reference
+- `GMAIL_LABELS`: comma-separated parent labels; sublabels are included.
+- `DATE_WINDOW_DAYS`: Gmail lookback query window.
+- `FILTER_KEYWORDS`: keyword drop list for subject/snippet.
+- `MAX_EMAILS_PER_LABEL`: cap per parent label for each run.
+- `SUMMARISATION_PERSONA`: tone and prioritization input to the model.
+- `GEMINI_MODEL`: model name used for summarization and key numbers pass.
+- `DROPBOX_FOLDER_PATH`: destination folder for daily brief markdown.
 
-All configuration is read from environment variables (loaded via `python-dotenv` locally, GitHub Secrets in Actions).
+## Security and Privacy Rules
 
-- **`GMAIL_LABELS`**: Comma‑separated label names (parent labels supported).
-  - Example: `Education,AI Product Management`
-- **`DATE_WINDOW_DAYS`**: Lookback window used by Gmail query (`newer_than:Xd`).
-- **`FILTER_KEYWORDS`**: Comma‑separated keywords/phrases; if a keyword appears in subject/snippet, the email is dropped.
-- **`MAX_EMAILS_PER_LABEL`**: Cap per parent label for the time window.
-- **`SUMMARISATION_PERSONA`**: Persona string to steer summaries.
-- **`GEMINI_MODEL`**: Model name (example: `gemini-2.0-flash`).
-
----
+- Never commit secrets to the repo (including `.env`, docs, screenshots, issues, PR text).
+- Keep `.env.example` as placeholders only.
+- Use GitHub encrypted secrets for CI.
+- Rotate credentials immediately if exposed.
+- Prefer Dropbox refresh-token auth for reliable scheduled runs.
+- This repo includes secret scanning guardrails (`.github/workflows/gitleaks.yml`).
 
 ## Troubleshooting
 
-- **Digest is empty**: Check the Actions logs for `[label] ... fetched=...` counts.
-  - If `fetched=0`, increase `DATE_WINDOW_DAYS` temporarily or verify labels have recent mail.
-- **Brief missing in Dropbox**: Check Actions logs for Dropbox auth errors and verify `DROPBOX_FOLDER_PATH` exists for your app’s permission scope (App folder vs full Dropbox).
-- **Gmail label not found**: Ensure label names match Gmail exactly (case-insensitive, but spacing matters).
-- **`unauthorized_client`**: The **refresh token and OAuth client do not match**. `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, and `GMAIL_REFRESH_TOKEN` must all come from the **same** OAuth 2.0 Client ID in Google Cloud. Re-issue the refresh token after fixing the client ID/secret (e.g. do not pair a token from OAuth Playground with a different client’s secrets).
-- **`invalid_grant` / “Token has been expired or revoked”**: Your **Gmail OAuth refresh token** is no longer valid for Google’s token endpoint.
-  - **Fix**: Complete the OAuth consent flow again locally, copy the new **refresh token**, and update the `GMAIL_REFRESH_TOKEN` repository secret. Confirm `GMAIL_CLIENT_ID` and `GMAIL_CLIENT_SECRET` still match the same OAuth client in Google Cloud.
-  - **Why it happens** (you cannot fully “prevent” Google from invalidating tokens, but you can reduce surprises):
-    - You **revoked** the app under [Google Account → Third-party access](https://myaccount.google.com/permissions).
-    - The OAuth client **secret was regenerated** in Google Cloud Console.
-    - The OAuth consent screen is in **Testing** mode: refresh tokens for users outside your workspace can **expire after 7 days** unless you publish the app or use a supported long-lived setup for your use case.
-    - Google may invalidate older refresh tokens when **too many** are issued for the same user + OAuth client (typical limit is on the order of **50** per user per client).
-  - Summaries use the **`google-genai`** Python client (Gemini API).
-
----
-
-## Security
-
-- Treat **Gmail OAuth** (`GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`), **Gemini** (`GEMINI_API_KEY`), and **Dropbox** (`DROPBOX_ACCESS_TOKEN`) as **password‑equivalent**.
-- **`.env`** is gitignored: keep all real values there or in GitHub Secrets only. **`.env.example`** must stay a blank template so pushes pass [secret scanning / push protection](https://docs.github.com/en/code-security/secret-scanning/working-with-secret-scanning-and-push-protection/working-with-push-protection-from-the-command-line).
-- Do not paste tokens into screenshots, Copilot chat, or support threads; revoke and rotate anything that was exposed.
-- This repository includes a **Gitleaks** workflow (`.github/workflows/gitleaks.yml`) to help catch accidental secret commits on `main` and pull requests.
-
----
-
-## License
-
-Add a license if you plan to distribute this broadly.
+- `Gmail label not found`: confirm exact label names in `GMAIL_LABELS`.
+- `unauthorized_client`: Gmail refresh token and client credentials do not match.
+- `invalid_grant`: Gmail refresh token is expired/revoked; re-issue token.
+- `expired_access_token` (Dropbox): move to refresh-token Dropbox auth secrets.
+- Key numbers odd output: sanitizer now enforces strict numeric blockquote format and falls back cleanly.
