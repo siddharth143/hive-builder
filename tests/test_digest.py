@@ -18,6 +18,7 @@ from digest import (
     _parse_gemini_response,
     _parse_hashtags,
     _sanitize_key_numbers_markdown,
+    _strip_incomplete_trailing_main_point,
     _truncate,
 )
 
@@ -230,6 +231,23 @@ def test_parse_hashtags_empty_string_returns_empty():
 
 def test_parse_hashtags_single_tag():
     assert _parse_hashtags("#google") == ["#google"]
+
+
+# ── _strip_incomplete_trailing_main_point ─────────────────────────────────────
+
+def test_strip_incomplete_trailing_main_point_keeps_when_last_has_period():
+    pts = ["First idea.", "Second idea."]
+    assert _strip_incomplete_trailing_main_point(pts) == pts
+
+
+def test_strip_incomplete_trailing_main_point_drops_cut_off_last_bullet():
+    pts = ["Complete sentence here.", "The author provides a '10-year tour"]
+    assert _strip_incomplete_trailing_main_point(pts) == ["Complete sentence here."]
+
+
+def test_strip_incomplete_trailing_main_point_keeps_question_exclamation():
+    assert _strip_incomplete_trailing_main_point(["Really?"]) == ["Really?"]
+    assert _strip_incomplete_trailing_main_point(["Stop!"]) == ["Stop!"]
 
 
 # ── _parse_gemini_response ─────────────────────────────────────────────────────

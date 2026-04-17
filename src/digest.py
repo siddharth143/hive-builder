@@ -32,7 +32,9 @@ GMAIL_SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
 GMAIL_TOKEN_URI = "https://oauth2.googleapis.com/token"
 GMAIL_EXECUTE_RETRIES = 3       # built-in retry in googleapiclient .execute()
 
-GEMINI_MAX_OUTPUT_TOKENS = 3072
+# Per-email structured summaries can be long; too-small limits truncate mid-bullet.
+GEMINI_MAX_OUTPUT_TOKENS = 8192
+GEMINI_SUMMARISE_MAX_TOKENS_EXTENDED = 12288
 GEMINI_KEY_NUMBERS_MAX_TOKENS = 768
 GEMINI_MAX_WORKERS = 5          # concurrent summarisation threads
 GEMINI_RETRY_ATTEMPTS = 3       # per-call retry on transient errors
@@ -195,6 +197,33 @@ def _email_sort_timestamp(item: EmailItem) -> float:
         return dt.timestamp()
     except Exception:
         return 0.0
+
+
+def _strip_incomplete_trailing_main_point(points: list[str]) -> list[str]:
+    """
+    If the last main-point bullet looks cut off (no sentence-ending punctuation),
+    drop it. Model truncation usually affects only the final bullet.
+    """
+    if not points:
+        return points
+    last = points[-1].strip()
+    if re.search(r"[.!?]['\"]?\s*$", last):
+        return points
+    return points[:-1]
+
+
+def _gemini_finish_reason_name(resp: Any) -> str | None:
+    """Return finish_reason enum name (e.g. MAX_TOKENS) if present."""
+    try:
+        cands = getattr(resp, "candidates", None) or []
+        if not cands:
+            return None
+        fr = getattr(cands[0], "finish_reason", None)
+        if fr is None:
+            return None
+        return getattr(fr, "name", None) or str(fr)
+    except Exception:
+        return None
 
 
 # ── Email body extraction ──────────────────────────────────────────────────────
@@ -573,6 +602,7 @@ def _parse_gemini_response(text: str) -> ScoredSummary | None:
                 for line in points_m.group(1).splitlines()
                 if re.match(r"\s*[-•*]", line) and line.strip()
             ]
+            main_points = _strip_incomplete_trailing_main_point(main_points)
 
         topics = _parse_hashtags(topic_m.group(1)) if topic_m else []
         companies = _parse_hashtags(company_m.group(1)) if company_m else []
@@ -632,7 +662,8 @@ PER-ARTICLE RULES (this email)
   - Dense (long / technical) = 4
 - **TL;DR** — 2–3 sentences. Concrete numbers, names, or outcomes where they exist. Never vague.
 - **Key insight** — **exactly one sentence**: the single most useful or surprising thing; what to remember if nothing else is read.
-- **Main points** — 3–5 bullets (`- ` lines). Each a complete, concrete sentence — **not** a restatement of the TL;DR. Add a 4th or 5th bullet only if the article is genuinely dense.
+- **Main points** — **3–5** bullets (`- ` lines). Each must be one **complete** sentence ending with **`.`**, **`!`**, or **`?`** (include closing quotes before the final period if needed). **Not** a restatement of the TL;DR.
+- If you are tight on length, output **fewer** bullets (minimum **3**) — **never** stop mid-sentence, mid-quote, or mid-word. A truncated bullet is worse than one fewer bullet.
 - **Topic** / **Company** — hashtags in kebab-case (e.g. `#openai`). Use `None` if none apply.
 - **Theme** — exactly **one** line from this list (copy spelling and casing exactly):
 {theme_list}
@@ -647,6 +678,7 @@ NEVER include:
 ALWAYS:
 - Put **only** the OUTPUT FIELD BLOCK in your response after you decide to keep the email (no preamble)
 - Use sentence case for Article title
+- Every **Main points** line must be a full sentence with terminal punctuation before the next line starts
 
 DISCARD RULE
 Output the single word SKIP — nothing else — if the email is:
@@ -692,20 +724,32 @@ def _summarise(
     """Call Gemini to summarise *item*. Returns None if Gemini SKIPped the email."""
     prompt = _build_summarise_prompt(cfg, item, brief_date_str)
 
-    def _call() -> Any:
+    def _call(max_tokens: int) -> Any:
         return client.models.generate_content(
             model=cfg["gemini_model"],
             contents=prompt,
-            config={"max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS},
+            config={"max_output_tokens": max_tokens},
         )
 
     resp = _with_retry(
-        _call,
+        lambda: _call(GEMINI_MAX_OUTPUT_TOKENS),
         max_attempts=GEMINI_RETRY_ATTEMPTS,
         backoff_base=GEMINI_RETRY_BACKOFF,
         retryable=_RETRYABLE_GEMINI,
         label=f"gemini/summarise {item.msg_id}",
     )
+    if _gemini_finish_reason_name(resp) == "MAX_TOKENS":
+        _debug(
+            f"[gemini] summarise finish_reason=MAX_TOKENS msg={item.msg_id}; "
+            f"retrying with max_output_tokens={GEMINI_SUMMARISE_MAX_TOKENS_EXTENDED}"
+        )
+        resp = _with_retry(
+            lambda: _call(GEMINI_SUMMARISE_MAX_TOKENS_EXTENDED),
+            max_attempts=GEMINI_RETRY_ATTEMPTS,
+            backoff_base=GEMINI_RETRY_BACKOFF,
+            retryable=_RETRYABLE_GEMINI,
+            label=f"gemini/summarise_retry {item.msg_id}",
+        )
     text = (getattr(resp, "text", "") or "").strip()
     return _parse_gemini_response(text)
 
